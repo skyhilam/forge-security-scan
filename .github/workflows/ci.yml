@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # 靜態檢查（包括會喺遠端執行嘅腳本）
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck -S warning forge-security-scan.sh tests/smoke-test.sh
+      - run: ./forge-security-scan.sh -P | shellcheck -s bash -S warning -
+
+  # 喺 Ubuntu 24.04 佈置假攻擊痕跡，確認全部揾得到
+  smoke-test:
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash tests/smoke-test.sh
+
+  # 本機部分要兼容 macOS 內置嘅 bash 3.2
+  macos-bash32:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: /bin/bash -n forge-security-scan.sh
+      - run: /bin/bash forge-security-scan.sh -h && /bin/bash forge-security-scan.sh -V
+      - name: 連線失敗時應回傳 3
+        run: |
+          set +e
+          /bin/bash forge-security-scan.sh -C nonexistent.invalid
+          test "$?" = 3

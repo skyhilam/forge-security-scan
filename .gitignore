@@ -1,0 +1,5 @@
+# 私人伺服器清單同掃描報告，唔好 commit
+servers.txt
+reports/
+*.report.txt
+.DS_Store

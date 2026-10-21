@@ -1,0 +1,5 @@
+# 伺服器清單：每行一部，格式 [用戶@]主機[:port]
+# 複製做 servers.txt 再修改（servers.txt 已加入 .gitignore，唔會被 commit）
+203.0.113.10
+web2.example.com:2222
+root@db1.example.com
