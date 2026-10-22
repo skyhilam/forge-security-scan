@@ -108,9 +108,9 @@ cp servers.example.txt servers.txt   # 編輯成你嘅伺服器
 
 | # | 項目 | 內容 |
 |---|---|---|
-| 1-1 | PHP 版本 | 每個已安裝版本對照 CVE-2026-109618／109619 嘅修補版本。會讀 Ubuntu／Debian 套件 changelog 判斷有冇 backport，標示 EOL 版本，未修補時列出升級指令同官方臨時措施 |
+| 1-1 | PHP 版本 | 每個已安裝版本對照 CVE-2026-109618／109619 嘅修補版本。會讀 Ubuntu／Debian 套件 changelog 判斷有冇 backport，標示 EOL 版本，未修補時列出升級指令同官方臨時措施。**亦會偵測「已升級但 FPM 未重啟」**——即係硬碟上已修補，但運行緊嘅仍然係舊程式 |
 | 0 | 伺服器資訊 | 作業系統係咪已停止標準支援（例如 Ubuntu 20.04：apt 已經攞唔到 PHP 修補）、雲端平台同 cloud-init 預設用戶 |
-| 1-2 | Node.js／Next.js | 會檢查：<br>• 已安裝嘅 Node.js（PATH、nvm、volta、fnm）同運行中嘅 node 進程<br>• 運行中 `next-server` 嘅版本<br>• 已部署專案入面 `node_modules` 嘅 `next` 同 `react-server-dom-*` |
+| 1-2 | Node.js／Next.js | 會檢查：<br>• 已安裝嘅 Node.js（PATH、nvm、volta、fnm）同運行中嘅 node 進程<br>• 運行中 `next-server` 嘅版本<br>• 已部署專案入面 `node_modules` 嘅 `next` 同 `react-server-dom-*`<br>• 升級咗但進程未重啟（運行緊已被取代嘅舊程式） |
 | 1-3 | **網站對應** | 讀 nginx 設定，逐個網站列出由邊個 PHP-FPM 版本或者邊個 Node.js 進程處理（`proxy_pass` port → 進程 → 版本同工作目錄），直接睇到邊啲網站受影響。亦會標示：<br>• 可以用伺服器 IP 直接連入（繞過 Cloudflare）嘅預設網站<br>• nginx 有 PHP location 但網站目錄冇 PHP 檔（可以刪走，減少暴露）<br>• proxy port 冇服務監聽（已停用嘅網站） |
 | 2 | `session.upload_progress.enabled` | 會檢查：<br>• 每個 FPM 版本嘅 `php.ini`<br>• 每個 pool 嘅覆寫<br>• `.user.ini` 同 nginx `PHP_VALUE`<br>• 改完設定之後 FPM 有冇 reload（由 pid 檔判斷，唔使 sudo） |
 | 3-1 | 可疑子進程 | 會檢查：<br>• bash、curl、wget、nc、python 等進程係咪由 `php-fpm` 開出嚟<br>• 由 `/tmp` 執行嘅進程<br>• 執行檔已被刪除嘅進程<br>• 挖礦程式<br>• 疑似 reverse shell 嘅連線<br>• crontab |
@@ -145,7 +145,7 @@ Forge 用 ondrej PPA，可以直接升級：
 sudo apt-get update && sudo apt-get install --only-upgrade 'php8.3-*'   # 換成你嘅版本
 ```
 
-升級之後喺 Forge 後台「Restart PHP」，再跑一次 `forge-security-scan.sh` 確認。
+升級之後**一定要**喺 Forge 後台「Restart PHP」(或者 `sudo service php8.3-fpm restart`)，否則運行緊嘅仍然係舊程式。再跑一次 `forge-security-scan.sh` 確認。
 
 **未能即時升級**，可以先用官方嘅臨時措施（**唔完整**，只可以爭取時間），然後重啟所有 worker：
 

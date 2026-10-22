@@ -29,7 +29,7 @@
 # 授權：MIT
 # =============================================================================
 
-VERSION="1.2.1"
+VERSION="1.3.0"
 
 # ---------- 預設值 ----------
 SSH_USER="forge"      # 預設 SSH 用戶
@@ -202,6 +202,46 @@ fixed_for() {
         [ "$(branch_of "$f" "$3")" = "$(branch_of "$2" "$3")" ] && { echo "$f"; return; }
     done
 }
+# PHP-FPM 最後啟動／reload 嘅時間，輸出「epoch 有冇可靠證據(1/0)」
+fpm_loaded_time() {
+    local v="$1" mpid et loaded evidence=0 pidf pm last_ready le
+    mpid=$(fpm_master_pid "$v")
+    et=$(ps -o etimes= -p "$mpid" 2>/dev/null | tr -d ' ')
+    loaded=$((NOW - ${et:-0}))
+    # FPM 每次 start／reload 都會重寫 pid 檔（唔使 sudo 都讀到修改時間）
+    pidf=$(awk -F= '/^[[:space:]]*pid[[:space:]]*=/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "/etc/php/$v/fpm/php-fpm.conf" 2>/dev/null)
+    pm=$(stat -c %Y "${pidf:-/run/php/php$v-fpm.pid}" 2>/dev/null)
+    if [ -n "$pm" ]; then evidence=1; [ "$pm" -gt "$loaded" ] && loaded=$pm; fi
+    # 後備：FPM log 嘅 "ready to handle connections"（通常要 sudo 先讀到）
+    last_ready=$(priv tail -n 5000 "/var/log/php$v-fpm.log" 2>/dev/null \
+        | grep -a 'ready to handle connections' | tail -n1 | sed -E 's/^\[([^]]+)\].*/\1/')
+    if [ -n "$last_ready" ]; then
+        le=$(date -d "$(printf '%s' "$last_ready" | tr '-' ' ')" +%s 2>/dev/null)
+        if [ -n "$le" ]; then evidence=1; [ "$le" -gt "$loaded" ] && loaded=$le; fi
+    fi
+    echo "$loaded $evidence"
+}
+
+# 升級咗 PHP 但 FPM 未重啟：運行中嘅仍然係舊程式。輸出原因，冇問題就冇輸出
+fpm_stale() {
+    local v="$1" mpid bin pid exe loaded evidence bct
+    mpid=$(fpm_master_pid "$v")
+    [ -n "$mpid" ] || return 0
+    bin="/usr/sbin/php-fpm$v"
+    # 方法一（直接證據）：程式檔被取代後，運行中進程嘅 /proc/<pid>/exe 會顯示 (deleted)。
+    # master 屬 root（要 sudo），worker 通常屬 forge（唔使 sudo）
+    for pid in "$mpid" $(ps -o pid= --ppid "$mpid" 2>/dev/null); do
+        exe=$(priv readlink "/proc/$pid/exe" 2>/dev/null)
+        case "$exe" in *" (deleted)") echo "運行中嘅 FPM 進程（PID $pid）用緊已被取代嘅舊程式檔"; return 0 ;; esac
+    done
+    # 方法二（後備）：程式檔嘅 ctime（實際安裝時間，dpkg 改唔到）晚過 FPM 最後載入時間
+    read -r loaded evidence <<< "$(fpm_loaded_time "$v")"
+    bct=$(stat -L -c %Z "$bin" 2>/dev/null)
+    if [ -n "$bct" ] && [ "$evidence" = 1 ] && [ "$bct" -gt "$loaded" ]; then
+        echo "程式檔喺 $(fmt_ts "$bct") 更新，但 FPM 最後載入時間係 $(fmt_ts "$loaded")"
+    fi
+}
+
 # Node.js 版本狀態：ok／vuln（低過修補版本）／eol（已停止支援）／unknown
 node_state() {
     local ver="$1" major fixed
@@ -359,6 +399,15 @@ main() {
             case "$pkgver" in *ubuntu*|*deb1[0-9]u*) case "$pkgver" in *sury*) ;; *) hint "呢個係發行版官方套件（$pkgver），修補會以 backport 形式推出，請留意 Ubuntu／Debian 安全公告" ;; esac ;; esac
             hint "未能即時升級：官方臨時措施係 session.upload_progress.enabled=0、memory_limit=-1$( [ "$(branch_of "$full" 2)" = 8.5 ] && echo '、fatal_error_backtraces=0')，然後重啟所有 worker（唔完整，只可以爭取時間）"
         fi
+        # 硬碟上嘅版本已修補，但 FPM 未重啟嘅話，運行緊嘅仍然係舊版
+        if [ "${PHP_STATE[$v]}" = ok ] && [ "$st" = "FPM 運行中" ]; then
+            stale=$(fpm_stale "$v")
+            if [ -n "$stale" ]; then
+                PHP_STATE[$v]=stale
+                alert "PHP $v：已升級但 FPM 未重啟，運行緊嘅仍然係舊版，漏洞未修補（$stale）"
+                hint "喺 Forge 按「Restart PHP」，或者 sudo service php$v-fpm restart，然後再跑一次確認"
+            fi
+        fi
         [ "$(branch_of "${full:-$v}" 2)" = "8.2" ] && info "PHP 8.2 官方安全支援至 2026-12-31，請準備升級"
     done
 
@@ -370,7 +419,10 @@ main() {
     # 運行中嘅 node 進程（包括 Next.js 正式環境嘅 next-server）
     # 注意：next-server 會改進程名稱（入面有空格），所以直接比對成行
     NODE_PROCS=$(ps -eo pid=,user=,comm=,args= 2>/dev/null | awk '$3 == "node" || $3 == "nodejs" || /next-server \(v/')
-    RUNNING_EXES=$(printf '%s\n' "$NODE_PROCS" | awk 'NF {print $1}' | while read -r pid; do readlink -f "/proc/$pid/exe" 2>/dev/null; done | sort -u)
+    RUNNING_EXES=$(printf '%s\n' "$NODE_PROCS" | awk 'NF {print $1}' | while read -r pid; do
+                       exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
+                       case "$exe" in ""|*" (deleted)") ;; *) readlink -f "/proc/$pid/exe" ;; esac
+                   done | sort -u)
 
     # 已安裝嘅 node：PATH、常見位置、nvm／volta／fnm
     NODE_BINS=$( { command -v node nodejs
@@ -406,6 +458,16 @@ main() {
             warn "$label：$problem（如果只係用嚟 build 前端，風險較低，但建議升級）"
         fi
     done
+    # 程式檔被取代（例如 apt 升級咗 /usr/bin/node）但進程未重啟：運行緊嘅係舊版
+    node_stale=$(printf '%s\n' "$NODE_PROCS" | awk 'NF {print $1}' | while read -r pid; do
+                     exe=$(readlink "/proc/$pid/exe" 2>/dev/null)
+                     case "$exe" in *" (deleted)") echo "PID $pid | ${exe% (deleted)} | $(readlink -f "/proc/$pid/cwd" 2>/dev/null)" ;; esac
+                 done)
+    if [ -n "$node_stale" ]; then
+        alert "有 Node.js 進程運行緊已被取代嘅舊程式（升級咗但未重啟，版本未知，當未修補處理）："
+        printf '%s\n' "$node_stale" | detail 999
+        hint "重啟呢啲服務（例如 pm2 restart <app>，或者喺 Forge 重啟 daemon），然後再跑一次確認"
+    fi
     other_procs=$(printf '%s\n' "$NODE_PROCS" | awk 'NF {print $1, $2}' | while read -r pid user; do
                       [ -z "$(readlink -f "/proc/$pid/exe" 2>/dev/null)" ] && echo "PID $pid | 用戶 $user | $(ps -o args= -p "$pid" 2>/dev/null)"
                   done)
@@ -468,10 +530,13 @@ main() {
     # 讀取 PID 嘅資料，結果放入 PN_NAME／PN_VER／PN_STATE／PN_CWD（唔用 subshell，等快取有效）
     pid_info() {
         local exe
-        exe=$(readlink -f "/proc/$1/exe" 2>/dev/null)
+        exe=$(readlink "/proc/$1/exe" 2>/dev/null)
+        case "$exe" in *" (deleted)") ;; ?*) exe=$(readlink -f "/proc/$1/exe" 2>/dev/null) ;; esac
         PN_CWD=$(readlink -f "/proc/$1/cwd" 2>/dev/null)
         PN_NAME=$(basename "${exe:-?}"); PN_VER=""; PN_STATE=other
         case "$exe" in
+            */node" (deleted)"|*/nodejs" (deleted)")
+                PN_NAME="Node.js（舊版，程式檔已被取代）"; PN_VER=""; PN_STATE=stale ;;
             */node|*/nodejs)
                 [ -z "${NODE_VER_CACHE[$exe]+x}" ] && NODE_VER_CACHE[$exe]=$("$exe" -v 2>/dev/null | tr -d v)
                 PN_NAME="Node.js"; PN_VER=${NODE_VER_CACHE[$exe]}; PN_STATE=$(node_state "$PN_VER") ;;
@@ -533,6 +598,7 @@ main() {
                     ok)      PHP_GOOD+="$label → PHP $pv"$'\n' ;;
                     vuln)    PHP_BAD+="$label → PHP $pv（未修補$phpnote）"$'\n'; [ "$direct" = 1 ] && DIRECT_BAD+="$cname → PHP $pv"$'\n' ;;
                     eol)     PHP_BAD+="$label → PHP $pv（已停止支援，冇修補$phpnote）"$'\n'; [ "$direct" = 1 ] && DIRECT_BAD+="$cname → PHP $pv"$'\n' ;;
+                    stale)   PHP_BAD+="$label → PHP $pv（已升級但 FPM 未重啟，運行緊舊版$phpnote）"$'\n'; [ "$direct" = 1 ] && DIRECT_BAD+="$cname → PHP $pv"$'\n' ;;
                     missing) SITE_UNKNOWN+="$label → PHP $pv（呢部機冇安裝呢個版本嘅 FPM）"$'\n' ;;
                     *)       SITE_UNKNOWN+="$label → PHP $pv（版本狀態未能確認）"$'\n' ;;
                 esac
@@ -559,6 +625,7 @@ main() {
                         ok)     NODE_GOOD+="$desc"$'\n' ;;
                         vuln)   NODE_BAD+="$desc：未修補"$'\n' ;;
                         eol)    NODE_BAD+="$desc：已停止支援，冇修補"$'\n' ;;
+                        stale)  NODE_BAD+="$desc：升級咗但進程未重啟，運行緊舊版"$'\n' ;;
                         noperm) SITE_UNKNOWN+="$label → port $port → PID $pid（無權限讀取，需要 sudo）"$'\n' ;;
                         other)  SITE_UNKNOWN+="$label → port $port → $PN_NAME（PID $pid，唔係 Node.js）"$'\n' ;;
                         *)      SITE_UNKNOWN+="$desc：版本唔喺公告範圍，請自行確認"$'\n' ;;
@@ -664,21 +731,7 @@ main() {
 
         # 檢查設定檔改完之後 FPM 有冇重新載入
         if [ "$running" = 1 ]; then
-            mpid=$(fpm_master_pid "$v")
-            et=$(ps -o etimes= -p "$mpid" 2>/dev/null | tr -d ' ')
-            loaded=$((NOW - ${et:-0}))
-            evidence=0
-            # FPM 每次 start／reload 都會重寫 pid 檔（唔使 sudo 都讀到修改時間）
-            pidf=$(awk -F= '/^[[:space:]]*pid[[:space:]]*=/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "/etc/php/$v/fpm/php-fpm.conf" 2>/dev/null)
-            pm=$(stat -c %Y "${pidf:-/run/php/php$v-fpm.pid}" 2>/dev/null)
-            if [ -n "$pm" ]; then evidence=1; [ "$pm" -gt "$loaded" ] && loaded=$pm; fi
-            # 後備：FPM log 嘅 "ready to handle connections"（通常要 sudo 先讀到）
-            last_ready=$(priv tail -n 5000 "/var/log/php$v-fpm.log" 2>/dev/null \
-                | grep -a 'ready to handle connections' | tail -n1 | sed -E 's/^\[([^]]+)\].*/\1/')
-            if [ -n "$last_ready" ]; then
-                le=$(date -d "$(printf '%s' "$last_ready" | tr '-' ' ')" +%s 2>/dev/null)
-                if [ -n "$le" ]; then evidence=1; [ "$le" -gt "$loaded" ] && loaded=$le; fi
-            fi
+            read -r loaded evidence <<< "$(fpm_loaded_time "$v")"
             newest=$(stat -L -c %Y "/etc/php/$v/fpm/php.ini" /etc/php/$v/fpm/conf.d/*.ini /etc/php/$v/fpm/pool.d/*.conf 2>/dev/null | sort -n | tail -n1)
             if [ -n "$newest" ] && [ "$newest" -gt "$loaded" ]; then
                 if [ "$evidence" = 1 ]; then

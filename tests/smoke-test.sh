@@ -176,6 +176,27 @@ out3=$(run_scan)
 expect "reload 之後設定已生效"             "$out3" "新設定已生效"
 expect_not "reload 之後冇未生效警告"       "$out3" "新設定未生效"
 
+# ---------- 情況四：模擬升級咗程式檔但未重啟 ----------
+# 用新檔取代 php-fpm 同 node 程式檔（同 apt 升級一樣：舊 inode 被刪走，運行中進程會見到 (deleted)）
+sleep 1
+for bin in /usr/sbin/php-fpm8.3 "$(readlink -f "$(command -v node)")"; do
+    cp -p "$bin" "$bin.new" && mv "$bin.new" "$bin"
+done
+echo "== 情況四：升級咗程式檔但未重啟 =="
+out4=$(run_scan)
+expect "PHP 已升級但 FPM 未重啟"           "$out4" "PHP 8.3：已升級但 FPM 未重啟，運行緊嘅仍然係舊版"
+expect "網站對應：FPM 未重啟"              "$out4" "php.test → PHP 8.3（已升級但 FPM 未重啟，運行緊舊版"
+expect "Node.js 程式檔被取代但未重啟"      "$out4" "有 Node.js 進程運行緊已被取代嘅舊程式"
+expect "網站對應：Node.js 未重啟"          "$out4" "node.test → port 3000 → Node.js（舊版，程式檔已被取代）"
+expect_not "唔會誤認做唔係 Node.js"        "$out4" "唔係 Node.js"
+
+# 重啟 FPM（reload 會重新載入新程式檔）
+kill -USR2 "$(cat /run/php/php8.3-fpm.pid)"
+sleep 2
+echo "== 情況五：FPM 重啟之後 =="
+out5=$(run_scan)
+expect_not "重啟 FPM 之後冇未重啟警告"     "$out5" "已升級但 FPM 未重啟"
+
 echo
 echo "結果：PASS ${PASS}，FAIL ${FAIL}"
 if [ "$FAIL" -gt 0 ]; then
