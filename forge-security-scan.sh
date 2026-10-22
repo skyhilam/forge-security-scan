@@ -3,8 +3,9 @@
 # forge-security-scan.sh
 #
 # 用途：喺本機透過 SSH 掃描一部或多部 Laravel Forge 伺服器，檢查：
-#   1. PHP 版本
-#   2. session.upload_progress.enabled 係咪已經設為 Off
+#   1-1. PHP 版本係咪已修補 CVE-2026-109618／CVE-2026-109619（2026-10-21）
+#   1-2. Node.js（2026-10-21 安全更新）同 Next.js／react-server-dom-*（2026-10-14）版本
+#   2. session.upload_progress.enabled 係咪已經設為 Off（臨時緩解）
 #   3. 攻擊跡象：
 #      3-1 PHP 進程有冇開出可疑子進程（bash、curl、wget、nc、python 等）
 #      3-2 Access log 有冇異常 multipart 上傳／PHP_SESSION_UPLOAD_PROGRESS 請求
@@ -28,7 +29,7 @@
 # 授權：MIT
 # =============================================================================
 
-VERSION="1.0.0"
+VERSION="1.2.1"
 
 # ---------- 預設值 ----------
 SSH_USER="forge"      # 預設 SSH 用戶
@@ -143,13 +144,13 @@ alert()   { printf '  %s[警告]%s %s\n' "$C_RED" "$C_RST" "$*"; ALERTS=$((ALERT
 
 # 縮排顯示明細（由 stdin 讀入），最多 MAX_LINES 行，每行最多 300 字元
 detail() {
-    local n=0 line
+    local n=0 line max="${1:-$MAX_LINES}"
     while IFS= read -r line; do
         [ -z "$line" ] && continue
         n=$((n + 1))
-        [ "$n" -le "$MAX_LINES" ] && printf '        %s%s%s\n' "$C_DIM" "${line:0:300}" "$C_RST"
+        [ "$n" -le "$max" ] && printf '        %s%s%s\n' "$C_DIM" "${line:0:300}" "$C_RST"
     done
-    [ "$n" -gt "$MAX_LINES" ] && printf '        %s…… 仲有 %d 行未顯示（可用 -n 調整）%s\n' "$C_DIM" $((n - MAX_LINES)) "$C_RST"
+    [ "$n" -gt "$max" ] && printf '        %s…… 仲有 %d 行未顯示（可用 -n 調整）%s\n' "$C_DIM" $((n - max)) "$C_RST"
     return 0
 }
 
@@ -178,6 +179,46 @@ priv() { if [ "$SUDO_OK" = 1 ]; then sudo -n "$@"; else "$@"; fi; }
 # 判斷某版本 PHP-FPM 係咪運行緊，同埋攞 master PID
 fpm_running()    { ps -eo args= 2>/dev/null | grep -q "^php-fpm: master process (/etc/php/$1/"; }
 fpm_master_pid() { ps -eo pid=,args= 2>/dev/null | awk -v p="master process (/etc/php/$1/" 'index($0, p) {print $1; exit}'; }
+
+# ---------- 已修補版本（有新安全公告時更新呢度）----------
+PHP_FIXED="8.2.35 8.3.36 8.4.27 8.5.12"    # CVE-2026-109618 / CVE-2026-109619（2026-10-21）
+NODE_FIXED="22.23.4 24.22.1 26.12.1"       # Node.js 2026-10-21 Security Releases
+NEXT_FIXED="15.5.28 16.4.1"                # Next.js 2026-10-14 安全更新
+RSC_FIXED="19.0.9 19.1.10 19.2.9 19.3.1"   # react-server-dom-*（2026-10-14）
+
+# ver_lt A B：A < B 就回傳 0（只比較頭三段數字）
+ver_lt() {
+    awk -v a="$1" -v b="$2" 'BEGIN {
+        split(a, x, /[.+-]/); split(b, y, /[.+-]/)
+        for (i = 1; i <= 3; i++) { if ((x[i] + 0) < (y[i] + 0)) exit 0; if ((x[i] + 0) > (y[i] + 0)) exit 1 }
+        exit 1 }'
+}
+# 取版本嘅頭 N 段，例如 branch_of 8.3.12 2 → 8.3
+branch_of() { printf '%s' "$1" | cut -d. -f1-"$2"; }
+# 喺修補清單入面搵同一分支嘅修補版本
+fixed_for() {
+    local f
+    for f in $1; do
+        [ "$(branch_of "$f" "$3")" = "$(branch_of "$2" "$3")" ] && { echo "$f"; return; }
+    done
+}
+# Node.js 版本狀態：ok／vuln（低過修補版本）／eol（已停止支援）／unknown
+node_state() {
+    local ver="$1" major fixed
+    major=${ver%%.*}
+    fixed=$(fixed_for "$NODE_FIXED" "$ver" 1)
+    if [ -n "$fixed" ]; then
+        if ver_lt "$ver" "$fixed"; then echo vuln; else echo ok; fi
+    elif [ "$major" -lt 22 ] 2>/dev/null || [ "$major" = 23 ] || [ "$major" = 25 ]; then
+        echo eol
+    else
+        echo unknown
+    fi
+}
+# 讀 package.json 嘅 version
+pkg_version() { grep -oE '"version"[[:space:]]*:[[:space:]]*"[^"]+"' "$1" 2>/dev/null | head -n1 | sed -E 's/.*"([^"]+)"$/\1/'; }
+# 提示行（縮排、暗色）
+hint() { printf '        %s%s%s\n' "$C_DIM" "$*" "$C_RST"; }
 
 main() {
     DAYS="${1:-7}"
@@ -225,8 +266,35 @@ main() {
     fi
     info "檢查範圍：最近 ${DAYS} 日"
 
+    # 作業系統標準支援期：過咗之後系統套件同 Forge 用嘅 ondrej PHP 套件源都唔會再有更新
+    OS_EOL=0
+    os_key=$(. /etc/os-release 2>/dev/null; echo "${ID:-}:${VERSION_ID:-}")
+    case "$os_key" in
+        ubuntu:16.04) os_end="2021-04-30" ;;
+        ubuntu:18.04) os_end="2023-05-31" ;;
+        ubuntu:20.04) os_end="2025-05-29" ;;
+        debian:9)     os_end="2022-06-30" ;;
+        debian:10)    os_end="2024-06-30" ;;
+        debian:11)    os_end="2026-08-31" ;;
+        *)            os_end="" ;;
+    esac
+    if [ -n "$os_end" ] && [ "$(date -d "$os_end" +%s 2>/dev/null || echo "$NOW")" -lt "$NOW" ]; then
+        OS_EOL=1
+        warn "作業系統 ${os_key/:/ } 已於 $os_end 停止標準支援：系統套件同 Forge 用嘅 PHP 套件源（ondrej）都唔會再有修補"
+        hint "apt 攞唔到最新修補；建議開一部新嘅 Forge 伺服器（Ubuntu 24.04）再搬網站"
+    fi
+
+    # 雲端平台同 cloud-init 預設用戶（例如 AWS 嘅 ubuntu）
+    CLOUD_USER=$(awk '/^[[:space:]]*default_user:/ {f = 1; next} f && /^[[:space:]]*name:/ {print $2; exit} f && /^[^[:space:]#]/ {exit}' /etc/cloud/cloud.cfg 2>/dev/null)
+    CLOUD_NAME=""
+    case "$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null)" in
+        *Amazon*) CLOUD_NAME="AWS" ;; *Google*) CLOUD_NAME="Google Cloud" ;; *Microsoft*) CLOUD_NAME="Azure" ;;
+        *DigitalOcean*) CLOUD_NAME="DigitalOcean" ;; *Hetzner*) CLOUD_NAME="Hetzner" ;; *Linode*|*Akamai*) CLOUD_NAME="Linode" ;;
+    esac
+    [ -n "$CLOUD_NAME" ] && info "雲端平台：$CLOUD_NAME"
+
     # =========================================================================
-    section "1. PHP 版本"
+    section "1-1. PHP 版本（CVE-2026-109618／CVE-2026-109619）"
     # =========================================================================
     PHP_VERSIONS=$(find /etc/php -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | grep -E '^[0-9]+\.[0-9]+$' | sort -V)
     if command -v php >/dev/null 2>&1; then
@@ -235,6 +303,8 @@ main() {
         warn "搵唔到 php 指令"
     fi
     [ -z "$PHP_VERSIONS" ] && warn "/etc/php 下面搵唔到任何已安裝嘅 PHP 版本"
+    info "已修補版本：$(printf '%s' "$PHP_FIXED" | sed 's/ /／/g')（2026-10-21；官方：升級係唯一完整修補）"
+    declare -A PHP_STATE    # 每個 PHP 版本嘅狀態，1-3 網站對應會用：ok／vuln／eol／unknown
 
     for v in $PHP_VERSIONS; do
         full=""
@@ -246,23 +316,297 @@ main() {
             st="冇安裝 FPM"
         fi
         msg="PHP ${full:-$v}（$st）"
-        # 官方支援期：8.1 或以下已 EOL；8.2 安全更新至 2026-12-31
-        num=$(( ${v%%.*} * 100 + ${v#*.} ))
-        if [ "$num" -lt 802 ]; then
-            if [ "$st" = "FPM 運行中" ]; then
-                warn "$msg：已停止官方安全更新（EOL），建議升級"
-            else
-                info "$msg：已 EOL，但 FPM 冇運行"
+        fixed=$(fixed_for "$PHP_FIXED" "${full:-$v}" 2)
+
+        # Ubuntu／Debian 官方套件會 backport 修補但唔改版本號，所以要睇套件 changelog
+        backport=0
+        for pkg in "php$v-fpm" "php$v-common" "php$v-cli"; do
+            cl=$(zcat -f "/usr/share/doc/$pkg/changelog.Debian.gz" 2>/dev/null | head -n 400)
+            if printf '%s' "$cl" | grep -q 'CVE-2026-109618' && printf '%s' "$cl" | grep -q 'CVE-2026-109619'; then
+                backport=1; break
             fi
-        elif [ "$num" -eq 802 ]; then
-            info "$msg：官方安全支援至 2026-12-31，請準備升級"
+        done
+        pkgver=$(dpkg-query -W -f='${Version}' "php$v-common" 2>/dev/null)
+
+        if [ -z "$full" ]; then
+            PHP_STATE[$v]=unknown
+            info "$msg：無法取得完整版本號"
+        elif [ -n "$fixed" ] && ! ver_lt "$full" "$fixed"; then
+            PHP_STATE[$v]=ok
+            ok "$msg：已包含 2026-10-21 嘅修補"
+        elif [ "$backport" = 1 ]; then
+            PHP_STATE[$v]=ok
+            ok "$msg：套件 changelog 顯示已 backport CVE-2026-109618／109619 修補（$pkgver）"
+        elif [ -z "$fixed" ] && ! ver_lt "$full" "8.2.0"; then
+            PHP_STATE[$v]=unknown
+            info "$msg：唔喺 2026-10-21 公告列出嘅分支，請自行確認"
         else
-            ok "$msg"
+            if [ -n "$fixed" ]; then why="低過已修補版本 $fixed"; PHP_STATE[$v]=vuln; else why="已停止官方支援（EOL），冇官方修補"; PHP_STATE[$v]=eol; fi
+            if [ "$st" = "FPM 運行中" ]; then
+                alert "$msg：$why，受 CVE-2026-109618／CVE-2026-109619（未經驗證遠端執行程式碼）影響，請立即升級"
+            else
+                warn "$msg：$why（FPM 冇運行，網頁暫時唔受影響，仍建議升級）"
+            fi
+            if [ "$OS_EOL" = 1 ] && [ -z "$fixed" ]; then
+                hint "PHP $v 冇官方修補，而且作業系統已停止支援：要開新伺服器（Ubuntu 24.04），並將網站轉去 PHP 8.3／8.4"
+            elif [ "$OS_EOL" = 1 ]; then
+                hint "作業系統已停止支援，apt 攞唔到 $fixed：要開新伺服器（Ubuntu 24.04）搬網站，或者用付費 PHP LTS（例如 Freexian）"
+            elif [ -n "$fixed" ]; then
+                hint "升級：sudo apt-get update && sudo apt-get install --only-upgrade 'php$v-*'，再喺 Forge 重啟 PHP"
+            else
+                hint "PHP $v 冇官方修補，要轉去 8.2 或以上嘅已修補版本"
+            fi
+            case "$pkgver" in *ubuntu*|*deb1[0-9]u*) case "$pkgver" in *sury*) ;; *) hint "呢個係發行版官方套件（$pkgver），修補會以 backport 形式推出，請留意 Ubuntu／Debian 安全公告" ;; esac ;; esac
+            hint "未能即時升級：官方臨時措施係 session.upload_progress.enabled=0、memory_limit=-1$( [ "$(branch_of "$full" 2)" = 8.5 ] && echo '、fatal_error_backtraces=0')，然後重啟所有 worker（唔完整，只可以爭取時間）"
         fi
+        [ "$(branch_of "${full:-$v}" 2)" = "8.2" ] && info "PHP 8.2 官方安全支援至 2026-12-31，請準備升級"
     done
 
     # =========================================================================
-    section "2. session.upload_progress.enabled（建議設為 Off）"
+    section "1-2. Node.js／Next.js 版本"
+    # =========================================================================
+    info "已修補版本：Node.js $(printf '%s' "$NODE_FIXED" | sed 's/ /／/g')（2026-10-21）；Next.js $(printf '%s' "$NEXT_FIXED" | sed 's/ /／/g')（2026-10-14）"
+
+    # 運行中嘅 node 進程（包括 Next.js 正式環境嘅 next-server）
+    # 注意：next-server 會改進程名稱（入面有空格），所以直接比對成行
+    NODE_PROCS=$(ps -eo pid=,user=,comm=,args= 2>/dev/null | awk '$3 == "node" || $3 == "nodejs" || /next-server \(v/')
+    RUNNING_EXES=$(printf '%s\n' "$NODE_PROCS" | awk 'NF {print $1}' | while read -r pid; do readlink -f "/proc/$pid/exe" 2>/dev/null; done | sort -u)
+
+    # 已安裝嘅 node：PATH、常見位置、nvm／volta／fnm
+    NODE_BINS=$( { command -v node nodejs
+                   ls -1d /usr/bin/node /usr/local/bin/node /opt/*/bin/node \
+                          /home/*/.nvm/versions/node/*/bin/node /root/.nvm/versions/node/*/bin/node \
+                          /home/*/.volta/tools/image/node/*/bin/node \
+                          /home/*/.local/share/fnm/node-versions/*/installation/bin/node
+                   printf '%s\n' "$RUNNING_EXES"; } 2>/dev/null \
+                 | while read -r b; do [ -n "$b" ] && [ -x "$b" ] && readlink -f "$b"; done | sort -u)
+
+    if [ -z "$NODE_BINS" ] && [ -z "$NODE_PROCS" ]; then
+        ok "冇發現 Node.js"
+    fi
+    for b in $NODE_BINS; do
+        ver=$("$b" -v 2>/dev/null); ver=${ver#v}
+        [ -z "$ver" ] && continue
+        running=0; printf '%s\n' "$RUNNING_EXES" | grep -qxF "$b" && running=1
+        if [ "$running" = 1 ]; then label="Node.js $ver（$b，有進程運行中）"; else label="Node.js $ver（$b）"; fi
+        major=${ver%%.*}
+        fixed=$(fixed_for "$NODE_FIXED" "$ver" 1)
+        problem=""
+        if [ -n "$fixed" ]; then
+            if ver_lt "$ver" "$fixed"; then problem="低過已修補版本 $fixed"; else ok "$label：已包含 2026-10-21 嘅修補"; fi
+        elif [ "$major" -lt 22 ] || [ "$major" = 23 ] || [ "$major" = 25 ]; then
+            problem="已停止官方支援（EOL），冇修補"
+        else
+            info "$label：唔喺 2026-10-21 公告列出嘅版本，請自行確認"
+        fi
+        [ -z "$problem" ] && continue
+        if [ "$running" = 1 ]; then
+            alert "$label：$problem（包括 Brotli 解壓 RCE CVE-2026-111497 等 High 級漏洞）"
+        else
+            warn "$label：$problem（如果只係用嚟 build 前端，風險較低，但建議升級）"
+        fi
+    done
+    other_procs=$(printf '%s\n' "$NODE_PROCS" | awk 'NF {print $1, $2}' | while read -r pid user; do
+                      [ -z "$(readlink -f "/proc/$pid/exe" 2>/dev/null)" ] && echo "PID $pid | 用戶 $user | $(ps -o args= -p "$pid" 2>/dev/null)"
+                  done)
+    if [ -n "$other_procs" ]; then
+        info "以下 node 進程無權限讀取執行檔，唔知用緊邊個 Node.js（通常係其他用戶嘅進程，需要 sudo）："
+        printf '%s\n' "$other_procs" | detail
+    fi
+
+    # Next.js：運行中嘅 next-server 會喺進程名稱顯示版本
+    next_running=$(printf '%s\n' "$NODE_PROCS" | grep -oE 'next-server \(v[^)]+\)' | sed -E 's/.*\(v([^)]+)\)/\1/' | sort -u)
+    # Next.js 同 react-server-dom-*：已部署專案入面嘅 node_modules
+    NEXT_PKGS=$(find /home /var/www -maxdepth 8 -path '*/node_modules/next/package.json' \
+                    ! -path '*/node_modules/*/node_modules/*' 2>/dev/null | sort)
+    RSC_PKGS=$(find /home /var/www -maxdepth 8 -path '*/node_modules/react-server-dom-*/package.json' \
+                   ! -path '*/node_modules/*/node_modules/*' 2>/dev/null | sort)
+
+    check_next() {      # check_next <版本> <描述>
+        local v="$1" where="$2" major fixed
+        major=${v%%.*}
+        fixed=$(fixed_for "$NEXT_FIXED" "$v" 1)
+        if [ -n "$fixed" ]; then
+            if ver_lt "$v" "$fixed"; then
+                alert "Next.js $v（$where）：低過 $fixed，受 2026-10-14 公布嘅未經驗證 RCE 影響，請升級"
+            else
+                ok "Next.js $v（$where）：已包含 2026-10-14 嘅修補"
+            fi
+        elif [ "$major" -ge 10 ] 2>/dev/null && [ "$major" -le 14 ]; then
+            alert "Next.js $v（$where）：受 Image Optimization SVG RCE 影響而且冇官方修補，請升級到 15.5.28 或 16.4.1 以上"
+        else
+            info "Next.js $v（$where）：唔喺公告列出嘅受影響範圍，請自行確認"
+        fi
+    }
+    for nv in $next_running; do check_next "$nv" "運行中嘅 next-server"; done
+    for f in $NEXT_PKGS; do
+        nv=$(pkg_version "$f"); [ -n "$nv" ] && check_next "$nv" "${f%/node_modules/*}"
+    done
+    for f in $RSC_PKGS; do
+        rv=$(pkg_version "$f"); [ -z "$rv" ] && continue
+        name=$(basename "$(dirname "$f")")
+        fixed=$(fixed_for "$RSC_FIXED" "$rv" 2)
+        if [ -n "$fixed" ] && ver_lt "$rv" "$fixed"; then
+            alert "$name $rv（${f%/node_modules/*}）：低過 $fixed，受 React Server Components 未經驗證 RCE 影響"
+        elif [ -n "$fixed" ]; then
+            ok "$name $rv（${f%/node_modules/*}）：已修補"
+        fi
+    done
+    [ -z "$next_running$NEXT_PKGS$RSC_PKGS" ] && [ -n "$NODE_BINS" ] && info "冇發現已部署嘅 Next.js 專案"
+
+    # =========================================================================
+    section "1-3. 網站對應：每個網站由邊個 PHP／Node.js 處理請求"
+    # =========================================================================
+    # 監聽緊嘅 port → PID（冇 sudo 只睇到自己用戶嘅進程）
+    LISTEN=$(ss -ltnpH 2>/dev/null | awk '{
+        n = split($4, a, ":"); port = a[n]; rest = $0
+        while (match(rest, /pid=[0-9]+/)) { print port, substr(rest, RSTART + 4, RLENGTH - 4); rest = substr(rest, RSTART + RLENGTH) }
+    }' | sort -u)
+    # 所有監聽中嘅 port（唔使 sudo 都睇到，只係睇唔到屬邊個進程）
+    LISTEN_ALL=" $(ss -ltnH 2>/dev/null | awk '{n = split($4, a, ":"); print a[n]}' | sort -u | tr '\n' ' ')"
+    declare -A NODE_VER_CACHE
+    # 讀取 PID 嘅資料，結果放入 PN_NAME／PN_VER／PN_STATE／PN_CWD（唔用 subshell，等快取有效）
+    pid_info() {
+        local exe
+        exe=$(readlink -f "/proc/$1/exe" 2>/dev/null)
+        PN_CWD=$(readlink -f "/proc/$1/cwd" 2>/dev/null)
+        PN_NAME=$(basename "${exe:-?}"); PN_VER=""; PN_STATE=other
+        case "$exe" in
+            */node|*/nodejs)
+                [ -z "${NODE_VER_CACHE[$exe]+x}" ] && NODE_VER_CACHE[$exe]=$("$exe" -v 2>/dev/null | tr -d v)
+                PN_NAME="Node.js"; PN_VER=${NODE_VER_CACHE[$exe]}; PN_STATE=$(node_state "$PN_VER") ;;
+            "") PN_NAME="?"; PN_STATE=noperm ;;
+        esac
+    }
+
+    PHP_BAD=""; PHP_GOOD=""; NODE_BAD=""; NODE_GOOD=""; SITE_UNKNOWN=""; STATIC_SITES=""; MAPPED_PIDS=" "
+    DIRECT_BAD=""; NO_PHP_FILES=0
+    if [ ! -d /etc/nginx/sites-enabled ]; then
+        skip "搵唔到 /etc/nginx/sites-enabled"
+    else
+        for conf in /etc/nginx/sites-enabled/*; do
+            [ -f "$conf" ] || continue
+            cname=$(basename "$conf")
+            # 網站設定 + Forge 嘅 include（forge-conf/<網站>/before|server|after），去除註解
+            cbody=$(cat "$conf" /etc/nginx/forge-conf/"$cname"/*/* 2>/dev/null | sed 's/#.*//')
+            # 用字詞比對（設定可能寫晒喺同一行）；Forge 自動加嘅 www. 別名唔重複顯示
+            names=$(printf '%s\n' "$cbody" | grep -oE '(^|[[:space:];{])server_name[[:space:]]+[^;]+' | sed -E 's/.*server_name[[:space:]]+//' \
+                    | tr -s ' \t' '\n\n' | grep -vxE '_|' | sort -u \
+                    | awk '{n[$0] = 1} END {for (x in n) if (!(x ~ /^www\./ && (substr(x, 5) in n))) print x}' | sort)
+            others=$(printf '%s\n' $names | grep -vxF "$cname" | tr '\n' ' '); others=${others% }
+            if [ -z "$names" ]; then label="$cname"
+            elif printf '%s\n' $names | grep -qxF "$cname"; then label="$cname${others:+（另有 $others）}"
+            else label="$cname（server_name：$others）"; fi
+            # 預設網站或者 server_name 係 IP：直接用伺服器 IP 就連到，繞過 Cloudflare
+            direct=0
+            if printf '%s\n' "$cbody" | grep -qE 'listen[^;]*default_server' || printf '%s\n' $names | grep -qE '^[0-9]+(\.[0-9]+){3}$'; then
+                direct=1; label="$label【可以用伺服器 IP 直接連入】"
+            fi
+            # 網站目錄（用嚟判斷有冇 PHP 檔）
+            wroot=$(printf '%s\n' "$cbody" | grep -oE '(^|[[:space:];{])root[[:space:]]+[^;]+' | head -n1 | sed -E 's/.*root[[:space:]]+//')
+
+            # PHP：fastcgi_pass unix:/var/run/php/php8.3-fpm.sock（網站隔離會係 php8.3-fpm-<用戶>.sock）
+            phpvs=$(printf '%s\n' "$cbody" | grep -oE 'php[0-9]+\.[0-9]+-fpm' | sed -E 's/php([0-9.]+)-fpm/\1/' | sort -u)
+            # Node.js 等：proxy_pass http://127.0.0.1:3000，或者經 upstream
+            ports=$(printf '%s\n' "$cbody" | grep -oE 'proxy_pass[[:space:]]+https?://(127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])?:[0-9]+' | grep -oE '[0-9]+$')
+            for up in $(printf '%s\n' "$cbody" | grep -oE 'proxy_pass[[:space:]]+https?://[A-Za-z_][A-Za-z0-9_.-]*' | sed -E 's#.*://##' | grep -vE '^localhost$'); do
+                up_re=$(printf '%s' "$up" | sed 's/\./\\./g')
+                ports="$ports $(cat /etc/nginx/conf.d/*.conf /etc/nginx/sites-enabled/* 2>/dev/null | sed 's/#.*//' | tr '\n' ' ' \
+                    | grep -oE "upstream[[:space:]]+${up_re}[[:space:]]*\{[^}]*\}" | grep -oE ':[0-9]+' | tr -d ':')"
+            done
+            ports=$(printf '%s\n' $ports | sort -un)
+
+            handled=0
+            # nginx 有 PHP location，但網站目錄根本冇 PHP 檔（例如純 Node.js 網站）→ 可以刪走 PHP location
+            phpnote=""
+            if [ -n "$phpvs" ] && [ -n "$wroot" ]; then
+                if [ ! -d "$wroot" ]; then
+                    phpnote="；網站目錄 $wroot 唔存在"
+                elif [ -r "$wroot" ] && [ -z "$(find "$wroot" -maxdepth 2 -name '*.php' -print -quit 2>/dev/null)" ]; then
+                    phpnote="；網站目錄冇 PHP 檔，可以喺 nginx 刪走 PHP location"
+                    NO_PHP_FILES=$((NO_PHP_FILES + 1))
+                fi
+            fi
+            for pv in $phpvs; do
+                handled=1
+                case "${PHP_STATE[$pv]:-missing}" in
+                    ok)      PHP_GOOD+="$label → PHP $pv"$'\n' ;;
+                    vuln)    PHP_BAD+="$label → PHP $pv（未修補$phpnote）"$'\n'; [ "$direct" = 1 ] && DIRECT_BAD+="$cname → PHP $pv"$'\n' ;;
+                    eol)     PHP_BAD+="$label → PHP $pv（已停止支援，冇修補$phpnote）"$'\n'; [ "$direct" = 1 ] && DIRECT_BAD+="$cname → PHP $pv"$'\n' ;;
+                    missing) SITE_UNKNOWN+="$label → PHP $pv（呢部機冇安裝呢個版本嘅 FPM）"$'\n' ;;
+                    *)       SITE_UNKNOWN+="$label → PHP $pv（版本狀態未能確認）"$'\n' ;;
+                esac
+            done
+            for port in $ports; do
+                handled=1
+                pids=$(printf '%s\n' "$LISTEN" | awk -v p="$port" '$1 == p {print $2}')
+                if [ -z "$pids" ]; then
+                    case "$LISTEN_ALL" in
+                        *" $port "*) SITE_UNKNOWN+="$label → port $port（有服務監聽緊，但屬其他用戶，例如 root、pm2 或者 Docker；需要 sudo 先睇到版本）"$'\n' ;;
+                        *)           SITE_UNKNOWN+="$label → port $port（冇服務監聽：如果網站仍然有回應，即係已搬去其他伺服器，呢度係舊設定；否則 nginx 會回 502。冇用嘅話建議刪走網站設定）"$'\n' ;;
+                    esac
+                    continue
+                fi
+                declare -A seen=()
+                for pid in $pids; do
+                    MAPPED_PIDS+="$pid "
+                    pid_info "$pid"
+                    key="$PN_NAME|$PN_VER|$PN_CWD"
+                    [ -n "${seen[$key]+x}" ] && continue
+                    seen[$key]=1
+                    desc="$label → port $port → $PN_NAME${PN_VER:+ $PN_VER}（${PN_CWD:-PID $pid}）"
+                    case "$PN_STATE" in
+                        ok)     NODE_GOOD+="$desc"$'\n' ;;
+                        vuln)   NODE_BAD+="$desc：未修補"$'\n' ;;
+                        eol)    NODE_BAD+="$desc：已停止支援，冇修補"$'\n' ;;
+                        noperm) SITE_UNKNOWN+="$label → port $port → PID $pid（無權限讀取，需要 sudo）"$'\n' ;;
+                        other)  SITE_UNKNOWN+="$label → port $port → $PN_NAME（PID $pid，唔係 Node.js）"$'\n' ;;
+                        *)      SITE_UNKNOWN+="$desc：版本唔喺公告範圍，請自行確認"$'\n' ;;
+                    esac
+                done
+                unset seen
+            done
+            [ "$handled" = 0 ] && STATIC_SITES+="$label、"
+        done
+
+        if [ -n "$PHP_BAD" ]; then
+            alert "$(count_lines "$PHP_BAD") 個網站經未修補／已停止支援嘅 PHP 處理請求（受 CVE-2026-109618／109619 影響）："
+            printf '%s' "$PHP_BAD" | detail 999
+            [ "$NO_PHP_FILES" -gt 0 ] && hint "其中 $NO_PHP_FILES 個網站目錄冇 PHP 檔，但 nginx 仍然會將 .php 請求交畀 PHP-FPM；刪走呢啲 PHP location 可以減少暴露"
+        fi
+        if [ -n "$DIRECT_BAD" ]; then
+            alert "直接用伺服器 IP 連入（繞過 Cloudflare）會去到未修補嘅 PHP："
+            printf '%s' "$DIRECT_BAD" | detail 999
+            hint "建議喺 Forge 刪除呢個預設網站，或者改為 return 444；同時將防火牆（例如 AWS security group）嘅 80／443 限制為只接受 Cloudflare IP"
+        fi
+        if [ -n "$NODE_BAD" ]; then
+            alert "$(count_lines "$NODE_BAD") 個網站經未修補／已停止支援嘅 Node.js 處理請求："
+            printf '%s' "$NODE_BAD" | detail 999
+        fi
+        if [ -n "$PHP_GOOD$NODE_GOOD" ]; then
+            ok "以下網站用緊已修補嘅版本："
+            printf '%s%s' "$PHP_GOOD" "$NODE_GOOD" | detail 999
+        fi
+        if [ -n "$SITE_UNKNOWN" ]; then
+            info "以下網站未能完全確認："
+            printf '%s' "$SITE_UNKNOWN" | detail 999
+        fi
+        [ -n "$STATIC_SITES" ] && info "冇 PHP／Node.js 處理嘅網站（靜態檔案或者轉址）：${STATIC_SITES%、}"
+        [ -z "$PHP_BAD$NODE_BAD$PHP_GOOD$NODE_GOOD$SITE_UNKNOWN$STATIC_SITES" ] && info "/etc/nginx/sites-enabled 冇網站設定"
+
+        # 冇經 nginx 對應任何網站嘅 node 進程
+        orphan=$(printf '%s\n' "$NODE_PROCS" | awk 'NF {print $1}' | while read -r pid; do
+                     case "$MAPPED_PIDS" in *" $pid "*) continue ;; esac
+                     echo "PID $pid | $(readlink -f "/proc/$pid/cwd" 2>/dev/null || echo '?') | $(ps -o args= -p "$pid" 2>/dev/null)"
+                 done)
+        if [ -n "$orphan" ]; then
+            info "以下 Node.js 進程冇經 nginx 對應任何網站（可能係 worker、排程，或者直接開放 port）："
+            printf '%s\n' "$orphan" | detail
+        fi
+    fi
+
+    # =========================================================================
+    section "2. session.upload_progress.enabled（臨時緩解，唔可以取代升級 PHP）"
     # =========================================================================
     SESSION_PATHS="/var/lib/php/sessions"
     for v in $PHP_VERSIONS; do
@@ -312,7 +656,7 @@ main() {
         else
             msg="PHP $v FPM：On —— 受影響：${exposed# }（CLI = $cli）"
             if [ "$running" = 1 ]; then
-                warn "$msg；建議喺 /etc/php/$v/fpm/php.ini 設 session.upload_progress.enabled = Off 然後 reload FPM"
+                warn "$msg；建議喺 /etc/php/$v/fpm/php.ini 設 session.upload_progress.enabled = Off 然後 reload FPM（官方：只係部分緩解，升級 PHP 先係完整修補；修補後亦建議保持 Off）"
             else
                 info "$msg（FPM 冇運行）"
             fi
@@ -323,20 +667,27 @@ main() {
             mpid=$(fpm_master_pid "$v")
             et=$(ps -o etimes= -p "$mpid" 2>/dev/null | tr -d ' ')
             loaded=$((NOW - ${et:-0}))
-            # FPM 每次 start/reload 都會喺 log 寫 "ready to handle connections"
+            evidence=0
+            # FPM 每次 start／reload 都會重寫 pid 檔（唔使 sudo 都讀到修改時間）
+            pidf=$(awk -F= '/^[[:space:]]*pid[[:space:]]*=/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "/etc/php/$v/fpm/php-fpm.conf" 2>/dev/null)
+            pm=$(stat -c %Y "${pidf:-/run/php/php$v-fpm.pid}" 2>/dev/null)
+            if [ -n "$pm" ]; then evidence=1; [ "$pm" -gt "$loaded" ] && loaded=$pm; fi
+            # 後備：FPM log 嘅 "ready to handle connections"（通常要 sudo 先讀到）
             last_ready=$(priv tail -n 5000 "/var/log/php$v-fpm.log" 2>/dev/null \
                 | grep -a 'ready to handle connections' | tail -n1 | sed -E 's/^\[([^]]+)\].*/\1/')
             if [ -n "$last_ready" ]; then
                 le=$(date -d "$(printf '%s' "$last_ready" | tr '-' ' ')" +%s 2>/dev/null)
-                [ -n "$le" ] && [ "$le" -gt "$loaded" ] && loaded=$le
+                if [ -n "$le" ]; then evidence=1; [ "$le" -gt "$loaded" ] && loaded=$le; fi
             fi
             newest=$(stat -L -c %Y "/etc/php/$v/fpm/php.ini" /etc/php/$v/fpm/conf.d/*.ini /etc/php/$v/fpm/pool.d/*.conf 2>/dev/null | sort -n | tail -n1)
             if [ -n "$newest" ] && [ "$newest" -gt "$loaded" ]; then
-                if [ -n "$last_ready" ]; then
-                    warn "PHP $v：設定檔喺 $(fmt_ts "$newest") 修改過，但 FPM 最後載入時間係 $(fmt_ts "$loaded")，新設定未生效（需要 reload FPM）"
+                if [ "$evidence" = 1 ]; then
+                    warn "PHP $v：設定檔喺 $(fmt_ts "$newest") 修改過，但 FPM 最後載入時間係 $(fmt_ts "$loaded")，新設定未生效（需要喺 Forge 重啟 PHP，或者 reload FPM）"
                 else
                     info "PHP $v：設定檔修改時間 $(fmt_ts "$newest") 晚過 FPM 啟動時間 $(fmt_ts "$loaded")；如果改完已經 reload 可以忽略，否則新設定未生效"
                 fi
+            elif [ -n "$newest" ] && [ "$evidence" = 1 ] && [ $((NOW - newest)) -lt "$WINDOW" ]; then
+                ok "PHP $v：設定檔喺 $(fmt_ts "$newest") 修改，FPM 喺 $(fmt_ts "$loaded") 重新載入，新設定已生效"
             fi
         fi
     done
@@ -478,6 +829,13 @@ main() {
         LOG_SCAN=$(for f in "${LOGS[@]}"; do
                        if [ -r "$f" ]; then zcat -f -- "$f"; else priv zcat -f -- "$f"; fi
                    done 2>/dev/null | awk '
+            function ip2n(ip,   p) { if (split(ip, p, ".") != 4) return -1; return ((p[1] * 256 + p[2]) * 256 + p[3]) * 256 + p[4] }
+            function is_cf(ip,   n, i) { n = ip2n(ip); for (i = 1; i <= ncf; i++) if (n >= cfs[i] && n <= cfe[i]) return 1; return 0 }
+            BEGIN {
+                # Cloudflare IPv4 範圍（https://www.cloudflare.com/ips-v4）
+                nr = split("173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22", r, " ")
+                for (i = 1; i <= nr; i++) { split(r[i], cq, "/"); ncf++; cfs[ncf] = ip2n(cq[1]); cfe[ncf] = cfs[ncf] + 2 ^ (32 - cq[2]) - 1 }
+            }
             {
                 line = $0; l = tolower(line)
                 st = "-"; if (match(line, /" [0-9][0-9][0-9] /)) st = substr(line, RSTART + 2, 3)
@@ -495,11 +853,27 @@ main() {
                 isphp = (lpath ~ /\.(php[0-9]?|phtml|phar|pht|phps)$/ && lpath !~ /(^|\/)index\.php$/)
                 if (m == "POST") { post[$1]++; if (isphp) print "POSTPHP\t" st "\t" path }
                 else if (isphp && st ~ /^2/) print "GETPHP\t" st "\t" path
+                # 統計來源 IP 有幾多係 Cloudflare（即係 nginx 冇還原真實訪客 IP）
+                if ($1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) { ipn++; if (!($1 in cfc)) cfc[$1] = is_cf($1); if (cfc[$1]) cfn++ }
             }
-            END { print "TOTAL\t" NR; for (ip in post) print "POSTIP\t" post[ip] "\t" ip }')
+            END {
+                print "TOTAL\t" NR; print "CF\t" cfn + 0 "\t" ipn + 0
+                for (ip in post) print "POSTIP\t" post[ip] "\t" ip "\t" ((ip in cfc) && cfc[ip] ? "Cloudflare" : "")
+            }')
         tagged() { printf '%s\n' "$LOG_SCAN" | awk -F'\t' -v t="$1" '$1 == t'; }
 
         info "已分析 ${#LOGS[@]} 個 log 檔，共 $(tagged TOTAL | cut -f2) 行"
+
+        # 來源 IP 大部分係 Cloudflare：nginx 冇還原真實訪客 IP
+        cf_n=$(tagged CF | cut -f2); ip_n=$(tagged CF | cut -f3)
+        if [ "${ip_n:-0}" -gt 0 ] && [ $(( ${cf_n:-0} * 2 )) -gt "$ip_n" ]; then
+            if grep -rqsiE '^[[:space:]]*real_ip_header[[:space:]]+(CF-Connecting-IP|X-Forwarded-For)' /etc/nginx; then
+                info "log 入面 $(( cf_n * 100 / ip_n ))% 嘅請求來自 Cloudflare IP（nginx 已設定 real_ip_header）"
+            else
+                warn "log 入面 $(( cf_n * 100 / ip_n ))% 嘅請求來源係 Cloudflare IP：nginx 未設定還原真實訪客 IP，出事時追查唔到攻擊來源"
+                hint "喺 nginx http 區塊加 set_real_ip_from <Cloudflare IP 範圍>; 同 real_ip_header CF-Connecting-IP;（範圍：https://www.cloudflare.com/ips/）"
+            fi
+        fi
 
         # (a) PHP_SESSION_UPLOAD_PROGRESS
         up=$(tagged UP | cut -f3-)
@@ -552,7 +926,7 @@ main() {
         postip=$(tagged POSTIP | sort -t "$(printf '\t')" -k2,2nr | head -n 10)
         if [ -n "$postip" ]; then
             info "POST 請求最多嘅 IP（前 10 名，供參考）："
-            printf '%s\n' "$postip" | awk -F'\t' '{printf "%8s 次  %s\n", $2, $3}' | detail
+            printf '%s\n' "$postip" | awk -F'\t' '{printf "%8s 次  %s%s\n", $2, $3, ($4 != "" ? "（" $4 "）" : "")}' | detail
         fi
     fi
 
@@ -685,6 +1059,10 @@ main() {
         b=$(stat -c %W "$home" 2>/dev/null)
         case "$b" in ''|*[!0-9]*|0) ;; *) bt=$(fmt_ts "$b"); [ $((NOW - b)) -lt "$WINDOW" ] && recent_home=1 ;; esac
         desc="$u（UID $uid，家目錄 $home，shell $shell，家目錄建立於 $bt）"
+        if [ -n "$CLOUD_USER" ] && [ "$u" = "$CLOUD_USER" ]; then
+            info "雲端平台預設用戶（cloud-init 建立${CLOUD_NAME:+，$CLOUD_NAME}）：$desc；請確認佢嘅 SSH key 只有你自己嘅"
+            continue
+        fi
         case " $EXPECTED_USERS " in
             *" $u "*) info "可登入帳戶：$desc" ;;
             *)
@@ -702,6 +1080,10 @@ main() {
         [ -z "$mem" ] && continue
         info "$g 群組成員：$mem"
         for m in $(printf '%s' "$mem" | tr ',' ' '); do
+            if [ -n "$CLOUD_USER" ] && [ "$m" = "$CLOUD_USER" ]; then
+                info "$g 群組包括雲端平台預設用戶 $m（正常，但請確認佢嘅 SSH key）"
+                continue
+            fi
             case " $EXPECTED_USERS " in *" $m "*) ;; *) alert "$g 群組有非預期成員：$m" ;; esac
         done
     done
@@ -744,11 +1126,12 @@ main() {
     fi
 
     # (f) SSH authorized_keys
-    for home in $(awk -F: '$7 !~ /(nologin|false)$/ {print $6}' /etc/passwd | sort -u); do
+    for home in $(awk -F: '$7 != "" && $7 !~ /(nologin|false|sync|halt|shutdown)$/ {print $6}' /etc/passwd | sort -u); do
         f="$home/.ssh/authorized_keys"
         m=$(priv stat -c %Y "$f" 2>/dev/null)
         if [ -z "$m" ]; then
-            [ "$home" = /root ] && [ "$HAS_PRIV" = 0 ] && skip "無權限讀取 /root/.ssh/authorized_keys"
+            # 其他用戶嘅 .ssh 目錄冇 sudo 讀唔到（例如 root、雲端預設用戶）
+            [ "$HAS_PRIV" = 0 ] && [ "$home" != "$HOME" ] && [ -d "$home" ] && skip "無權限讀取 $f（需要 sudo）"
             continue
         fi
         cnt=$(priv grep -cvE '^[[:space:]]*(#|$)' "$f" 2>/dev/null)
