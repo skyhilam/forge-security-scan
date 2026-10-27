@@ -5,12 +5,15 @@
 # 用途：喺本機透過 SSH 掃描一部或多部 Laravel Forge 伺服器，檢查：
 #   1-1. PHP 版本係咪已修補 CVE-2026-109618／CVE-2026-109619（2026-10-21）
 #   1-2. Node.js（2026-10-21 安全更新）同 Next.js／react-server-dom-*（2026-10-14）版本
-#   2. session.upload_progress.enabled 係咪已經設為 Off（臨時緩解）
+#   1-4. Linux 核心 KSMBD 有冇啟用並對外服務（ZDI-CAN-33774／ZDI-CAN-33549，2026-10-22）
+#   2. PHP 官方臨時緩解齊唔齊（session.upload_progress.enabled／memory_limit 等）
 #   3. 攻擊跡象：
 #      3-1 PHP 進程有冇開出可疑子進程（bash、curl、wget、nc、python 等）
-#      3-2 Access log 有冇異常 multipart 上傳／PHP_SESSION_UPLOAD_PROGRESS 請求
-#      3-3 Web 目錄最近 N 日內新增或修改嘅 .php 檔
+#      3-2 Access log 有冇異常 multipart 上傳／PHP_SESSION_UPLOAD_PROGRESS／同秒 POST 批次請求
+#      3-3 Web 目錄最近 N 日內新增或修改嘅 .php 檔、有冇公開 PoC 工具檔案
 #      3-4 有冇可疑嘅新增系統用戶
+#      3-5 PHP-FPM／錯誤 log 有冇「請求解析階段 OOM（Unknown on line 0）」同 worker 段錯誤
+#          （2026-10-25 公開嘅 StealMyBitcoin-PoC 利用鏈會留低呢種形狀嘅痕跡）
 #
 # 注意：
 #   - 本腳本「只做檢查」，唔會喺遠端寫入任何檔案、修改設定或重啟服務。
@@ -29,7 +32,7 @@
 # 授權：MIT
 # =============================================================================
 
-VERSION="1.3.0"
+VERSION="1.5.0"
 
 # ---------- 預設值 ----------
 SSH_USER="forge"      # 預設 SSH 用戶
@@ -344,6 +347,7 @@ main() {
     fi
     [ -z "$PHP_VERSIONS" ] && warn "/etc/php 下面搵唔到任何已安裝嘅 PHP 版本"
     info "已修補版本：$(printf '%s' "$PHP_FIXED" | sed 's/ /／/g')（2026-10-21；官方：升級係唯一完整修補）"
+    info "2026-10-25 已有公開完整利用程式（KillaBoi/StealMyBitcoin-PoC，針對 Alpine PHP 8.4.26 CLI server 校準）證明可以由未經驗證請求行到 RCE；Forge 嘅 FPM 版本記憶體偏移唔同，但漏洞本身一樣，唔好假設用唔到"
     declare -A PHP_STATE    # 每個 PHP 版本嘅狀態，1-3 網站對應會用：ok／vuln／eol／unknown
 
     for v in $PHP_VERSIONS; do
@@ -673,7 +677,78 @@ main() {
     fi
 
     # =========================================================================
-    section "2. session.upload_progress.enabled（臨時緩解，唔可以取代升級 PHP）"
+    section "1-4. Linux 核心 KSMBD（ZDI-CAN-33774／ZDI-CAN-33549，2026-10-22 公開）"
+    # =========================================================================
+    # KSMBD 係核心入面嘅 SMB 檔案伺服器，唔係用戶空間 Samba（smbd）。
+    # 上游核心預設唔編入，要另外裝 ksmbd-tools 並啟用服務先會對外提供分享，
+    # 冇啟用就唔受呢兩個漏洞影響，所以重點係確認「有冇真係運行緊並對外監聽」，
+    # 唔可以齋睇核心版本號判 -- 2026-10-23 查證：兩項未配發 CVE，
+    # ZDI-CAN-33774（未經驗證競態 RCE）修補只喺 linux-next，未入 mainline／發行版核心，
+    # ZDI-CAN-33549 係 SMB Direct（RDMA）路徑，冇修補版本號可以對照。
+    KREL=$(uname -r)
+    ksmbd_loaded=0; grep -q '^ksmbd ' /proc/modules 2>/dev/null && ksmbd_loaded=1
+    # 核心編譯設定：/boot/config-<版號>，或者 /proc/config.gz
+    ksmbd_cfg=""; ksmbd_direct_cfg=""
+    if [ -r "/boot/config-$KREL" ]; then
+        ksmbd_cfg=$(grep -E '^CONFIG_SMB_SERVER=' "/boot/config-$KREL" 2>/dev/null | cut -d= -f2)
+        ksmbd_direct_cfg=$(grep -E '^CONFIG_SMB_SERVER_SMBDIRECT=' "/boot/config-$KREL" 2>/dev/null | cut -d= -f2)
+    elif [ -r /proc/config.gz ]; then
+        ksmbd_cfg=$(zcat /proc/config.gz 2>/dev/null | grep -E '^CONFIG_SMB_SERVER=' | cut -d= -f2)
+        ksmbd_direct_cfg=$(zcat /proc/config.gz 2>/dev/null | grep -E '^CONFIG_SMB_SERVER_SMBDIRECT=' | cut -d= -f2)
+    fi
+    # =y 即內建入核心（等同載入）；不過要 ksmbd.mountd 啟動先會真正對外服務
+    [ "$ksmbd_cfg" = y ] && ksmbd_loaded=1
+    ksmbd_daemon=0; ps -eo comm= 2>/dev/null | grep -qx 'ksmbd.mountd' && ksmbd_daemon=1
+    ksmbd_svc=""
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+        ksmbd_svc=$(systemctl is-active ksmbd 2>/dev/null)
+    fi
+    ksmbd_pkg=$(dpkg-query -W -f='${Version}' ksmbd-tools 2>/dev/null)
+    ksmbd_conf=""
+    for cf in /etc/ksmbd/ksmbd.conf /etc/ksmbd/smb.conf; do
+        [ -f "$cf" ] && ksmbd_conf="$ksmbd_conf $cf"
+    done
+    # 445 有冇監聽？有冇綁對外位址（唔止 loopback）？
+    smb_lines=$(ss -ltnH 2>/dev/null | awk '{n = split($4, a, ":"); if (a[n] == "445") print $4}')
+    smb445=0; smb_ext=0
+    [ -n "$smb_lines" ] && smb445=1
+    for addr in $smb_lines; do
+        case "$addr" in 127.0.0.1:*|'[::1]:'*|::1:*) ;; *) smb_ext=1 ;; esac
+    done
+    samba_running=0; ps -eo comm= 2>/dev/null | grep -qx 'smbd' && samba_running=1
+    # SMB Direct 要 RDMA 裝置，順便盤點（只影響 ZDI-CAN-33549 嗰條路）
+    rdma_dev=""
+    for d in /sys/class/infiniband/*; do [ -e "$d" ] && rdma_dev="$rdma_dev $(basename "$d")"; done
+
+    ksmbd_active=0
+    { [ "$ksmbd_loaded" = 1 ] || [ "$ksmbd_daemon" = 1 ] || [ "$ksmbd_svc" = active ]; } && ksmbd_active=1
+    info "核心 $KREL：CONFIG_SMB_SERVER=${ksmbd_cfg:-未搵到}，模組載入=${ksmbd_loaded}，ksmbd.mountd 進程=${ksmbd_daemon}，systemd ksmbd=${ksmbd_svc:-未確認}，ksmbd-tools=${ksmbd_pkg:-冇安裝}，設定檔=${ksmbd_conf:-冇}，SMB Direct 編譯=${ksmbd_direct_cfg:-未搵到}"
+
+    if [ "$ksmbd_active" = 1 ] && [ "$smb445" = 1 ] && [ "$smb_ext" = 1 ]; then
+        alert "KSMBD 運行緊並喺 445 對外監聽：受 ZDI-CAN-33774（未經驗證競態遠端執行程式碼，CVSS 9.0）影響；未有 CVE，修補未入 mainline／發行版核心，冇升級可以即時修補"
+        hint "唔需要核心 SMB 就即刻停用：sudo systemctl disable --now ksmbd，再 blacklist ksmbd 模組；要檔案分享可以改用用戶空間 Samba"
+        hint "必須繼續用 KSMBD：用防火牆／security group 將 445 收窄到信任網段，關閉 guest 分享（已知寫入路徑需要 guest share）同 SMB1，並追蹤發行版核心更新"
+        if [ -n "$rdma_dev" ]; then
+            warn "偵測到 RDMA 裝置（${rdma_dev# }）：ZDI-CAN-33549（SMB Direct RCE，CVSS 9.0）嘅前提部分成立，未用 SMB Direct 就好關咗佢"
+        fi
+    elif [ "$ksmbd_active" = 1 ] && [ "$smb445" = 1 ]; then
+        warn "KSMBD 運行緊，但 445 只監聽本機（loopback）：外來攻擊要先入到本機先觸及到；修補未出，冇必要就停用 ksmbd 服務"
+    elif [ "$ksmbd_active" = 1 ]; then
+        warn "KSMBD 已載入／服務運行中，但未見 445 監聽：暫時冇對外 SMB 攻擊面；冇必要就停用服務兼 blacklist 模組，費事日後開分享時先中招"
+    elif [ "$smb445" = 1 ] && [ "$samba_running" = 1 ]; then
+        info "445 有監聽，但係用戶空間 Samba（smbd），唔係核心 KSMBD，唔受 ZDI-CAN-33774／ZDI-CAN-33549 影響（Samba 本身要另外保持更新）"
+        ok "未有啟用 KSMBD，唔受呢兩個核心漏洞影響"
+    elif [ "$smb445" = 1 ]; then
+        warn "445 有監聽，但搵唔到 KSMBD 或 Samba（smbd）嘅進程證據，未能確認屬邊個服務（可能係 container 入面嘅服務）：請人手核實，如果係 KSMBD 就當受 ZDI-CAN-33774 影響處理"
+    else
+        ok "未有啟用 KSMBD（模組未載入、冇 ksmbd 服務、445 冇監聽），唔受 ZDI-CAN-33774／ZDI-CAN-33549 影響"
+        if [ -n "$ksmbd_pkg" ] || [ "$ksmbd_cfg" = m ]; then
+            info "留意：核心有 KSMBD 模組／已安裝 ksmbd-tools，只係未啟用；日後啟用分享前，記得先確認發行版核心已經修補"
+        fi
+    fi
+
+    # =========================================================================
+    section "2. PHP 官方臨時緩解（session.upload_progress.enabled／memory_limit；唔可以取代升級）"
     # =========================================================================
     SESSION_PATHS="/var/lib/php/sessions"
     for v in $PHP_VERSIONS; do
@@ -728,6 +803,26 @@ main() {
                 info "$msg（FPM 冇運行）"
             fi
         fi
+
+        # 官方臨時緩解嘅其餘部分（只喺版本未修補時先有意義），1-1 叫人照做，呢度負責驗證：
+        # 公開 PoC（StealMyBitcoin）正係靠喺 session upload-progress 解析期間撞爆
+        # memory_limit，等重用嘅 worker 留低殘留狀態，先行到位址洩漏同 RCE
+        case "${PHP_STATE[$v]:-unknown}" in
+            vuln|eol|stale)
+                ml=$(info_get "$finfo" 'memory_limit')
+                if [ "$ml" != "-1" ]; then
+                    hint "PHP $v：官方臨時緩解仲差 memory_limit = -1（而家係 ${ml:-未知}）：公開 PoC 要靠撞爆 memory_limit 先觸發到漏洞；未升級前可考慮跟官方咁設，但 -1 會放大資源耗盡（DoS）風險，只可以爭取時間"
+                else
+                    info "PHP $v：memory_limit = -1（符合官方臨時緩解；留意資源耗盡風險，仍要升級）"
+                fi
+                if [ "$v" = "8.5" ]; then
+                    fb=$(norm_bool "$(info_get "$finfo" 'fatal_error_backtraces')")
+                    [ "$fb" = "On" ] && hint "PHP $v：官方臨時緩解仲差 fatal_error_backtraces = 0（而家係 On，PHP 8.5 專屬）"
+                fi
+                ex=$(norm_bool "$(info_get "$finfo" 'expose_php')")
+                [ "$ex" = "On" ] && hint "PHP $v：expose_php = On：回應會帶 X-Powered-By 精確版本（公開 PoC 正係用佢確認目標版本先出手），建議設 Off（只增加偵察成本，唔係修補）"
+                ;;
+        esac
 
         # 檢查設定檔改完之後 FPM 有冇重新載入
         if [ "$running" = 1 ]; then
@@ -903,6 +998,21 @@ main() {
                 if (l ~ /sess_[a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9][a-z0-9]|\/var\/lib\/php|php:\/\/|phar:\/\/|data:\/\/|expect:\/\/|zip:\/\/|\.\.\/|\.\.%2f|%2e%2e|\/etc\/passwd|\/proc\/self/)
                     print "LFI\t" st "\t" line
                 if (index(l, "multipart")) print "MP\t" st "\t" line
+                # 同一秒、同 IP、同路徑嘅 POST 批次：公開 PoC 會將 1 個觸發 OOM 嘅
+                # multipart 請求加 8 個一模一樣嘅跟隨請求管線化喺同一條連線一次過送出，
+                # 而且唔帶 User-Agent；觸發用嘅欄位喺 POST body 入面，access log 只睇到呢種外型
+                ts = ""
+                if (match(line, /\[[0-9][0-9]\/[A-Za-z][A-Za-z][A-Za-z]\/[0-9][0-9][0-9][0-9]:[0-9][0-9]:[0-9][0-9]:[0-9][0-9]/))
+                    ts = substr(line, RSTART + 1, 20)
+                ua = ""
+                nq = split(line, qt, "\"")
+                if (nq >= 6) ua = qt[nq - 1]
+                if (m == "POST" && ts != "") {
+                    bk = $1 SUBSEP path SUBSEP ts
+                    if (!(bk in burst)) bkeys[++nb] = bk
+                    burst[bk]++
+                    if (ua == "" || ua == "-") noua[bk]++
+                }
                 isphp = (lpath ~ /\.(php[0-9]?|phtml|phar|pht|phps)$/ && lpath !~ /(^|\/)index\.php$/)
                 if (m == "POST") { post[$1]++; if (isphp) print "POSTPHP\t" st "\t" path }
                 else if (isphp && st ~ /^2/) print "GETPHP\t" st "\t" path
@@ -912,6 +1022,13 @@ main() {
             END {
                 print "TOTAL\t" NR; print "CF\t" cfn + 0 "\t" ipn + 0
                 for (ip in post) print "POSTIP\t" post[ip] "\t" ip "\t" ((ip in cfc) && cfc[ip] ? "Cloudflare" : "")
+                for (bi = 1; bi <= nb; bi++) {
+                    bk = bkeys[bi]
+                    if (burst[bk] >= 5) {
+                        split(bk, bp, SUBSEP)
+                        print "BURST\t" burst[bk] "\t" bp[1] "\t" bp[2] "\t" bp[3] "\t" (noua[bk] + 0)
+                    }
+                }
             }')
         tagged() { printf '%s\n' "$LOG_SCAN" | awk -F'\t' -v t="$1" '$1 == t'; }
 
@@ -981,6 +1098,15 @@ main() {
             info "POST 請求最多嘅 IP（前 10 名，供參考）："
             printf '%s\n' "$postip" | awk -F'\t' '{printf "%8s 次  %s%s\n", $2, $3, ($4 != "" ? "（" $4 "）" : "")}' | detail
         fi
+
+        # (g) 同一秒管線化 POST 批次（公開 PoC 嘅送出形狀：1 個 OOM 觸發請求 + 8 個跟隨請求）
+        bursts=$(tagged BURST | sort -t "$(printf '\t')" -k2,2nr)
+        if [ -n "$bursts" ]; then
+            warn "發現 $(count_lines "$bursts") 組同一秒內、同 IP、同路徑嘅 POST 批次（≥5 個）：公開 PoC 會將觸發 OOM 嘅請求同 8 個跟隨請求管線化一次過送出，外型就係咁；合法 API 客戶端短時間大量 POST 亦有可能，請用時間戳對照 3-5 嘅 FPM OOM 記錄判斷："
+            printf '%s\n' "$bursts" | awk -F'\t' '{s = sprintf("%s 次 | %s | %s | %s", $2, $3, $4, $5); if ($6 == $2) s = s "（全部冇 User-Agent）"; else if ($6 > 0) s = s sprintf("（其中 %s 個冇 User-Agent）", $6); print s}' | detail
+        else
+            ok "冇發現同一秒內嘅同 IP／同路徑 POST 批次"
+        fi
     fi
 
     # Laravel log 入面嘅相關痕跡
@@ -1002,13 +1128,27 @@ main() {
         if { [ -r "$sp" ] && [ -x "$sp" ]; } || [ "$HAS_PRIV" = 1 ]; then
             s_hits=$(priv find "$sp" -maxdepth 1 -type f -name 'sess_*' -exec grep -lasF 'upload_progress_' {} + 2>/dev/null)
             s_recent=$(priv find "$sp" -maxdepth 1 -type f -name 'sess_*' -mtime -"$DAYS" 2>/dev/null | grep -c .)
+            # 檔名異常：正常 PHP session id 多數 22–32 字元（只含英數同 ,-）；
+            # 公開 PoC 會用得一個字元、甚至 NUL byte 嘅 PHPSESSID 去觸發 upload-progress 路徑
+            s_short=$(priv find "$sp" -maxdepth 1 -type f -name 'sess_*' 2>/dev/null \
+                      | awk '{p = $0; n = p; sub(/.*\//, "", n); sub(/^sess_/, "", n); if (length(n) < 16 || n ~ /[^A-Za-z0-9,-]/) print p}')
+            s_flag=0
             if [ -n "$s_hits" ]; then
+                s_flag=1
                 alert "$sp 入面有 session 檔包含 upload_progress_ 資料（強烈攻擊跡象）："
                 printf '%s\n' "$s_hits" | detail
-            elif [ "$s_recent" -gt 0 ]; then
-                info "$sp：最近 ${DAYS} 日有 $s_recent 個 sess_ 檔，但冇 upload_progress_ 資料（upload progress 資料完成後會被清走，唔代表一定冇被攻擊）"
-            else
-                ok "$sp：冇可疑 session 檔"
+            fi
+            if [ -n "$s_short" ]; then
+                s_flag=1
+                warn "$sp 有 session 檔名異常短／含奇怪字元（正常 session id 多數 22–32 字元；公開 PoC 會用極短嘅 PHPSESSID 觸發 upload-progress 路徑）："
+                printf '%s\n' "$s_short" | detail
+            fi
+            if [ "$s_flag" = 0 ]; then
+                if [ "$s_recent" -gt 0 ]; then
+                    info "$sp：最近 ${DAYS} 日有 $s_recent 個 sess_ 檔，但冇 upload_progress_ 資料（upload progress 資料完成後會被清走，唔代表一定冇被攻擊）"
+                else
+                    ok "$sp：冇可疑 session 檔"
+                fi
             fi
         else
             skip "$sp 無權限列出（需要 sudo）"
@@ -1044,6 +1184,24 @@ main() {
         # (a) 特徵碼掃描（所有最近改動嘅 PHP 檔）
         sig_hits=$(printf '%s\n' "$CLASSIFIED" | awk -F'\t' 'NF >= 5 {print $5}' \
                    | xargs -r -d '\n' grep -lisE -- "$SIG" 2>/dev/null)
+        # 已知誤判：Laravel 12 官方檔案 Concurrency/Console/InvokeSerializedClosureCommand.php
+        # 有合法程式碼 base64_decode($_SERVER['LARAVEL_INVOKABLE_CLOSURE'])，
+        # 會命中 base64_decode($_ 特徵。只剔除呢個 vendor 檔案，而且條件係：
+        # 抽走官方嗰一整行之後，成個檔冇其他任何特徵先算誤判。
+        # 檔案俾人加多任何其他特徵（包括喺同一行加料），仍然會照樣警告。
+        if [ -n "$sig_hits" ]; then
+            sig_filtered=""
+            while IFS= read -r hit; do
+                [ -z "$hit" ] && continue
+                case "$hit" in
+                    */vendor/laravel/framework/src/Illuminate/Concurrency/Console/InvokeSerializedClosureCommand.php)
+                        grep -vE '^[[:space:]]*(base64_decode\([[:space:]]*\$_SERVER\[.LARAVEL_INVOKABLE_CLOSURE.\][[:space:]]*\)|isset\(\$_SERVER\[.LARAVEL_INVOKABLE_CLOSURE.\][[:space:]]*\)[[:space:]]*=>[[:space:]]*unserialize\([[:space:]]*base64_decode\([[:space:]]*\$_SERVER\[.LARAVEL_INVOKABLE_CLOSURE.\][[:space:]]*\)[[:space:]]*\)),?[[:space:]]*$' \
+                            "$hit" 2>/dev/null | grep -qisE -- "$SIG" || continue ;;
+                esac
+                sig_filtered="${sig_filtered}${hit}"$'\n'
+            done < <(printf '%s\n' "$sig_hits")
+            sig_hits=$(printf '%s' "$sig_filtered" | grep . || true)
+        fi
         if [ -n "$sig_hits" ]; then
             alert "$(count_lines "$sig_hits") 個最近改動嘅 PHP 檔含有 webshell 特徵："
             printf '%s\n' "$sig_hits" | detail
@@ -1094,6 +1252,16 @@ main() {
         printf '%s\n' "$tmp_files" | detail
     else
         ok "暫存目錄冇最近建立嘅 PHP 檔或可執行檔"
+    fi
+
+    # 公開 PoC 嘅工具／證據檔名（出現喺正式伺服器，即係有人喺度跑過或擺低咗利用程式）
+    poc_art=$(find /home/forge /var/www /tmp /var/tmp -xdev \
+                  \( -name node_modules -o -name vendor -o -name .git \) -prune -o \
+                  \( -type f \( -iname '*steal*bitcoin*' -o -iname 'print-flag' \) \
+                     -o -type d -iname 'poc-run-*' \) -print 2>/dev/null | head -n 50)
+    if [ -n "$poc_art" ]; then
+        alert "發現公開 PoC 工具／執行證據檔（StealMyBitcoin-PoC 嘅 stealmybitcoin_poc.py、poc-run-* 證據目錄或 print-flag）：有人喺呢部機跑過或擺低咗利用程式："
+        printf '%s\n' "$poc_art" | detail
     fi
 
     # =========================================================================
@@ -1198,6 +1366,61 @@ main() {
     if [ -n "$logins" ]; then
         info "最近 15 次登入（請確認 IP 係咪自己或 Forge）："
         printf '%s\n' "$logins" | detail
+    fi
+
+    # =========================================================================
+    section "3-5. 攻擊跡象：PHP 解析階段 OOM 利用鏈（StealMyBitcoin 公開 PoC 形狀）"
+    # =========================================================================
+    # 公開 PoC 嘅利用欄位全部喺 multipart POST body 入面，access log 睇唔到內容，
+    # 但觸發用嘅請求會喺「執行任何應用程式碼之前」嘅請求解析階段撞爆 memory_limit，
+    # 喺 FPM／nginx 錯誤 log 留低「Allowed memory size ... exhausted ... in Unknown
+    # on line 0」；偏移唔啱嘅後續嘗試仲可能整冧 FPM worker（SIGSEGV）。
+    # 一般應用程式 OOM 會指明出事嘅 .php 檔同行數，Unknown:0 係好唔尋常嘅形狀。
+    ERR_LOGS=(); ERR_UNREADABLE=()
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        if [ -r "$f" ] || [ "$SUDO_OK" = 1 ]; then ERR_LOGS+=("$f"); else ERR_UNREADABLE+=("$f"); fi
+    done < <(find /var/log -maxdepth 2 -type f \( -name 'php*-fpm.log*' -o -name '*error*.log*' \) -mtime -$((DAYS + 1)) 2>/dev/null | sort -u)
+
+    [ "${#ERR_UNREADABLE[@]}" -gt 0 ] && skip "${#ERR_UNREADABLE[@]} 個錯誤 log 無權限讀取（需要 sudo，或將 $(id -un) 加入 adm 群組）"
+
+    if [ "${#ERR_LOGS[@]}" -eq 0 ]; then
+        info "冇可以分析嘅 PHP-FPM／錯誤 log（/var/log 搵唔到最近有寫入嘅 php*-fpm.log 或 *error*.log）"
+    else
+        err_cat() {
+            local ef
+            for ef in "${ERR_LOGS[@]}"; do
+                if [ -r "$ef" ]; then zcat -f -- "$ef"; else priv zcat -f -- "$ef"; fi
+            done 2>/dev/null
+        }
+        # 一趟過數齊三樣：全部 OOM／其中 Unknown:0（解析階段）／FPM worker 段錯誤
+        err_stats=$(err_cat | awk '
+            /Allowed memory size of [0-9]+ bytes exhausted/ { oom++; if (/Unknown on line 0/) unk++ }
+            /exited on signal (7|11)([^0-9]|$)|SIGSEGV|SIGBUS/ { seg++ }
+            END { printf "%d %d %d\n", oom + 0, unk + 0, seg + 0 }')
+        read -r oom_n unk_n seg_n <<< "$err_stats"
+        info "已分析 ${#ERR_LOGS[@]} 個錯誤 log 檔（以檔案修改時間揀檔，未逐行按日期過濾，請以樣本行嘅時間戳為準）"
+        if [ "${unk_n:-0}" -ge 2 ]; then
+            alert "錯誤 log 有 $unk_n 次「請求解析階段」記憶體耗盡（Allowed memory size ... in Unknown on line 0）：應用程式本身好少會喺 Unknown:0 OOM，呢個正係公開 PoC 用嚟喺 worker 留低殘留狀態嘅觸發形狀，最新樣本："
+            err_cat | grep -aE 'Allowed memory size of [0-9]+ bytes exhausted' | grep -a 'Unknown on line 0' | tail -n "$MAX_LINES" | detail
+            hint "攞上面嘅時間戳去對照 3-2 嘅同秒 POST 批次同來源 IP：時間吻合嘅話，要當有人嘗試（甚至成功）利用 CVE-2026-109618／109619 處理，即刻升級 PHP 並保留 log 做事故調查"
+        elif [ "${unk_n:-0}" -eq 1 ]; then
+            warn "錯誤 log 有 1 次「請求解析階段」記憶體耗盡（Allowed memory size ... in Unknown on line 0）：形狀同公開 PoC 嘅觸發請求吻合，請用時間戳對照 3-2 嘅 POST 批次判斷："
+            err_cat | grep -aE 'Allowed memory size of [0-9]+ bytes exhausted' | grep -a 'Unknown on line 0' | tail -n "$MAX_LINES" | detail
+        else
+            ok "錯誤 log 冇發現解析階段 OOM（Unknown on line 0）"
+        fi
+        if [ "${oom_n:-0}" -gt "${unk_n:-0}" ]; then
+            info "另外有 $((oom_n - unk_n)) 次應用程式碼入面嘅 OOM（有指明 .php 檔同行數，多數係程式本身食記憶體，同今次漏洞關係較低）"
+        fi
+        if [ "${seg_n:-0}" -gt 0 ]; then
+            if [ "${unk_n:-0}" -gt 0 ]; then
+                alert "同期錯誤 log 有 $seg_n 次 FPM worker 段錯誤（SIGSEGV／SIGBUS）記錄：同解析階段 OOM 一齊出現，好可能係利用嘗試偏移唔啱整冧 worker，最新樣本："
+            else
+                warn "錯誤 log 有 $seg_n 次 FPM worker 段錯誤（SIGSEGV／SIGBUS）記錄（亦可能係 PHP 擴充套件本身嘅 bug，請核對時間）："
+            fi
+            err_cat | grep -aE 'exited on signal (7|11)([^0-9]|$)|SIGSEGV|SIGBUS' | tail -n "$MAX_LINES" | detail
+        fi
     fi
 
     # =========================================================================

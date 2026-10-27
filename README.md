@@ -3,15 +3,18 @@
 [![CI](https://github.com/skyhilam/forge-security-scan/actions/workflows/ci.yml/badge.svg)](https://github.com/skyhilam/forge-security-scan/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-經 SSH 快速排查 **Laravel Forge** 伺服器係咪受 **2026 年 10 月 PHP／Next.js／Node.js 重大漏洞**影響，逐個網站列出用緊邊個 PHP／Node.js 版本，同埋有冇被入侵嘅跡象。
+經 SSH 快速排查 **Laravel Forge** 伺服器係咪受 **2026 年 10 月 PHP／Next.js／Node.js／Linux 核心 KSMBD 重大漏洞**影響，逐個網站列出用緊邊個 PHP／Node.js 版本，同埋有冇被入侵嘅跡象。
 
 全程**只讀**：唔會改設定、唔會重啟服務，亦唔會喺伺服器寫入任何檔案。
 
 > English summary: a read-only, agentless Bash script that SSHes into one or more Laravel Forge
 > servers and checks PHP/Node.js/Next.js versions against the October 2026 security releases
 > (PHP CVE-2026-109618/109619 incl. Ubuntu backports, Next.js/React Server Components, Node.js),
+> checks whether the in-kernel SMB server KSMBD (ZDI-CAN-33774/33549) is enabled and exposed,
 > maps every nginx site to the PHP-FPM version or Node.js process that serves it, and looks for
-> indicators of compromise. Output is in Traditional Chinese (Cantonese).
+> indicators of compromise, including the shape left by the public StealMyBitcoin PoC
+> (parse-stage OOM fatals in FPM error logs, pipelined POST batches). Output is in
+> Traditional Chinese (Cantonese).
 
 ## ⚠ 2026 年 10 月重大漏洞
 
@@ -21,6 +24,7 @@
 | **Next.js** | `use cache` RCE、Image Optimization SVG RCE（CVE-2026-96889）、Server Actions DoS | **15.5.28／16.4.1** | 2026-10-14 |
 | **React Server Components** | `react-server-dom-*` 未經驗證 RCE | **19.0.9／19.1.10／19.2.9／19.3.1** | 2026-10-14 |
 | **Node.js** | Brotli 解壓 RCE（CVE-2026-111497）、TLS 主機名稱繞過等，共 10 個 | **22.23.4／24.22.1／26.12.1** | 2026-10-21 |
+| **Linux 核心 KSMBD** | ZDI-CAN-33774（未經驗證競態 RCE）、ZDI-CAN-33549（SMB Direct RCE），CVSS 9.0；只有啟用了核心 SMB 伺服器 KSMBD 並對外服務嘅主機受影響 | **未有**（未配發 CVE；2026-10-23 查證修補只喺 linux-next，未入 mainline／發行版） | 2026-10-22 |
 
 **重點：**
 
@@ -31,12 +35,16 @@
   - Next.js 14 或以下
   - Node.js 22 以前，同埋 23、25
 - Ubuntu／Debian 官方套件會 **backport** 修補，但係唔改版本號。例如 Ubuntu 24.04 嘅 `8.3.6-0ubuntu0.24.04.13` 已經修補咗。所以單睇版本號可能會誤判，`forge-security-scan.sh` 會讀套件 changelog 嚟確認。
+- **完整利用程式經已公開（2026-10-25，StealMyBitcoin-PoC）**：針對 Alpine PHP 8.4.26 CLI server 校準，證明可以由未經驗證嘅 multipart 請求一路行到洩漏記憶體位址、再到 RCE。Forge 嘅 FPM 版本記憶體偏移唔同，個 PoC 唔可以照抄即用，但漏洞本身一樣，要當「隨時會有人改到嚟打 FPM」咁處理，唔好再拖。
+- **KSMBD 唔係「所有 Linux 都中招」**：KSMBD 上游預設唔編入，要裝 `ksmbd-tools` 並啟用服務先會行。一般 Forge 伺服器冇啟用就唔受影響；有自己開 SMB 分享（例如 NAS 用途）先要即刻處理。注意唔好同用戶空間 Samba（`smbd`）混淆，兩者唔同程式碼。
 
 **來源：**
 
 - [PHP 公告](https://www.php.net/)：[GHSA-w8hw-w9fx-j79w](https://github.com/php/php-src/security/advisories/GHSA-w8hw-w9fx-j79w)、[GHSA-6wmf-4rv5-p3rp](https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp)
+- 公開 PoC：[KillaBoi/StealMyBitcoin-PoC](https://github.com/KillaBoi/StealMyBitcoin-PoC)（防禦方值得睇：入面寫明細利用鏈每一步嘅請求外型，本工具 3-2／3-5 嘅偵測就係按佢嚟寫）
 - [Next.js 安全公告](https://github.com/vercel/next.js/security/advisories)
 - [Node.js 2026-10-21 Security Releases](https://nodejs.org/en/blog/vulnerability/october-2026-security-releases)
+- KSMBD：[ZDI-CAN-33774 原始報告（LKML）](https://lore.kernel.org/lkml/BYAPR01MB383076AC412E19C48CFBEAE980662@BYAPR01MB3830.prod.exchangelabs.com/)、[ZDI-CAN-33549 原始報告（LKML）](https://lore.kernel.org/lkml/BYAPR01MB3830472B5702C089B0BBB77D80662@BYAPR01MB3830.prod.exchangelabs.com/)、[33774 修補（linux-next）](https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git/commit/?id=68f410faedaf6ee74d81e574733c50ebcc1bd8ed)、[Phoronix 報導](https://www.phoronix.com/news/LKML-New-Trend-Vulnerabilities)
 
 ## 點解唔係輸入網址就檢查到？
 
@@ -112,11 +120,13 @@ cp servers.example.txt servers.txt   # 編輯成你嘅伺服器
 | 0 | 伺服器資訊 | 作業系統係咪已停止標準支援（例如 Ubuntu 20.04：apt 已經攞唔到 PHP 修補）、雲端平台同 cloud-init 預設用戶 |
 | 1-2 | Node.js／Next.js | 會檢查：<br>• 已安裝嘅 Node.js（PATH、nvm、volta、fnm）同運行中嘅 node 進程<br>• 運行中 `next-server` 嘅版本<br>• 已部署專案入面 `node_modules` 嘅 `next` 同 `react-server-dom-*`<br>• 升級咗但進程未重啟（運行緊已被取代嘅舊程式） |
 | 1-3 | **網站對應** | 讀 nginx 設定，逐個網站列出由邊個 PHP-FPM 版本或者邊個 Node.js 進程處理（`proxy_pass` port → 進程 → 版本同工作目錄），直接睇到邊啲網站受影響。亦會標示：<br>• 可以用伺服器 IP 直接連入（繞過 Cloudflare）嘅預設網站<br>• nginx 有 PHP location 但網站目錄冇 PHP 檔（可以刪走，減少暴露）<br>• proxy port 冇服務監聽（已停用嘅網站） |
-| 2 | `session.upload_progress.enabled` | 會檢查：<br>• 每個 FPM 版本嘅 `php.ini`<br>• 每個 pool 嘅覆寫<br>• `.user.ini` 同 nginx `PHP_VALUE`<br>• 改完設定之後 FPM 有冇 reload（由 pid 檔判斷，唔使 sudo） |
+| 1-4 | Linux 核心 KSMBD | 會檢查：<br>• 核心 `CONFIG_SMB_SERVER` 編譯設定同 `ksmbd` 模組有冇載入<br>• `ksmbd.mountd` 進程／`ksmbd` systemd 服務／`ksmbd-tools` 套件同設定檔<br>• 445 有冇監聽、綁邊個位址（對外定只限本機）<br>• 有冇 RDMA 裝置（SMB Direct 漏洞 ZDI-CAN-33549 前提）<br>只有 KSMBD 真係運行緊並對外監聽先會判受 ZDI-CAN-33774／33549 影響；淨係用戶空間 Samba（`smbd`）唔會當係 KSMBD |
+| 2 | PHP 官方臨時緩解 | 會檢查：<br>• 每個 FPM 版本嘅 `php.ini` 嘅 `session.upload_progress.enabled`<br>• 每個 pool 嘅覆寫<br>• `.user.ini` 同 nginx `PHP_VALUE`<br>• 改完設定之後 FPM 有冇 reload（由 pid 檔判斷，唔使 sudo）<br>• 未修補版本嘅 `memory_limit`（官方臨時緩解要求 `-1`；公開 PoC 正係靠撞爆佢嚟觸發漏洞）、PHP 8.5 嘅 `fatal_error_backtraces`<br>• `expose_php`（公開 PoC 用 `X-Powered-By` 確認目標版本先出手） |
 | 3-1 | 可疑子進程 | 會檢查：<br>• bash、curl、wget、nc、python 等進程係咪由 `php-fpm` 開出嚟<br>• 由 `/tmp` 執行嘅進程<br>• 執行檔已被刪除嘅進程<br>• 挖礦程式<br>• 疑似 reverse shell 嘅連線<br>• crontab |
-| 3-2 | Access log | 會搵：<br>• `PHP_SESSION_UPLOAD_PROGRESS` 請求<br>• multipart 請求<br>• LFI<br>• POST 到 `index.php` 以外嘅 PHP 檔<br>• session 檔入面嘅 `upload_progress_` 資料<br>• 來源 IP 係咪大部分係 Cloudflare（即係 nginx 未還原真實訪客 IP） |
-| 3-3 | PHP 檔案 | 會檢查：<br>• 最近改動嘅 PHP 檔<br>• webshell 特徵碼<br>• Laravel `public/` 入面有冇 `index.php` 以外嘅 PHP 檔<br>• `storage/app` 有冇 PHP 檔<br>• 暫存目錄 |
+| 3-2 | Access log | 會搵：<br>• `PHP_SESSION_UPLOAD_PROGRESS` 請求<br>• multipart 請求<br>• LFI<br>• POST 到 `index.php` 以外嘅 PHP 檔<br>• **同一秒、同 IP、同路徑嘅 POST 批次**（公開 PoC 將 1 個 OOM 觸發請求 + 8 個跟隨請求管線化一次過送出；會埋數有幾多個冇 User-Agent）<br>• session 檔入面嘅 `upload_progress_` 資料、異常短嘅 session 檔名（PoC 用 1 字元 `PHPSESSID`）<br>• 來源 IP 係咪大部分係 Cloudflare（即係 nginx 未還原真實訪客 IP） |
+| 3-3 | PHP 檔案 | 會檢查：<br>• 最近改動嘅 PHP 檔<br>• webshell 特徵碼（已知誤判：Laravel 12 官方 `InvokeSerializedClosureCommand.php` 嘅 `base64_decode($_SERVER['LARAVEL_INVOKABLE_CLOSURE'])` 合法程式碼會自動剔除；檔案有任何其他特徵仍會警告）<br>• Laravel `public/` 入面有冇 `index.php` 以外嘅 PHP 檔<br>• `storage/app` 有冇 PHP 檔<br>• 暫存目錄<br>• 公開 PoC 嘅工具／證據檔名（`stealmybitcoin_poc.py`、`poc-run-*`、`print-flag`） |
 | 3-4 | 系統用戶 | 會檢查：<br>• root 以外嘅 UID 0 帳戶<br>• 非預期嘅可登入帳戶<br>• sudo 群組成員<br>• 帳戶檔有冇改動<br>• `useradd` 記錄<br>• `authorized_keys`<br>• 最近登入記錄 |
+| 3-5 | **PHP 解析階段 OOM** | 掃描 `/var/log` 嘅 `php*-fpm.log` 同 `*error*.log`：<br>• `Allowed memory size ... in Unknown on line 0`：喺執行任何應用程式碼之前、解析 multipart／upload-progress 期間 OOM，係公開 PoC 嘅觸發形狀（普通程式 OOM 會指明出事檔名同行數，會分開計，唔會撈亂）<br>• FPM worker 段錯誤（SIGSEGV／SIGBUS）；同上面同時間出現會升級做警告<br>• 會叫你攞錯誤 log 嘅時間戳，同 3-2 嘅同秒 POST 批次對照來源 IP |
 
 **輸出分級：**
 
@@ -130,7 +140,8 @@ cp servers.example.txt servers.txt   # 編輯成你嘅伺服器
 **限制：**
 
 - **Forge 預設 `access_log off`。** 大部分網站嘅請求唔會寫入 access log。
-- **POST 內容唔會出現喺預設 log 格式。** 所以 multipart 上傳只可以間接判斷。
+- **POST 內容唔會出現喺預設 log 格式。** 公開 PoC 嘅觸發欄位（包括 `PHP_SESSION_UPLOAD_PROGRESS`）全部喺 multipart POST body 入面，3-2 喺 access log URL 搵唔到唔代表冇俾人打過，要靠 3-5 嘅 FPM 錯誤 log 時間線同 POST 批次外型配合判斷。
+- **成功嘅 RCE 可以唔留低任何進程或檔案。** 公開 PoC 係喺請求入面即時執行指令、經返條連線嘅 socket 回傳結果，行完就完。3-1 嘅進程快照同 3-3 嘅檔案檢查捉唔到呢種一次性執行，所以錯誤 log 先係最可靠嘅事後痕跡。
 - **`forge` 用戶預設冇免密碼 sudo。** root 擁有嘅 log、`/var/lib/php/sessions`、其他用戶嘅進程會顯示「略過」。想做完整檢查，可以用 `-u root`。
 - **進程檢查只係即時快照。** 一次性嘅攻擊指令可能已經結束咗。
 - **冇發現異常唔代表一定冇被入侵。** 呢個工具係用嚟快速排查，唔可以取代完整嘅事故調查。
@@ -169,9 +180,21 @@ npm install next@latest
 
 升級到 22.23.4／24.22.1／26.12.1 或以上，再重啟所有 Node 服務。EOL 版本（22 以前、23、25）要轉去有支援嘅版本。
 
-### 4. 有入侵跡象（`[警告]`）
+### 4. Linux 核心 KSMBD
 
-1. 先保留證據：log、可疑檔案、`ps` 輸出。
+未有 CVE，亦未有發行版修補可以升級（修補只入咗 linux-next）。如果唔需要核心 SMB 分享，最穩陣係停用並禁止載入模組：
+
+```bash
+sudo systemctl disable --now ksmbd
+echo 'blacklist ksmbd' | sudo tee /etc/modprobe.d/blacklist-ksmbd.conf
+# 重開機先完全生效；要檔案分享可以改用用戶空間 Samba（smbd）
+```
+
+必須繼續用 KSMBD 嘅話：將 445 用防火牆／security group 收窄到信任網段、關閉 guest 分享同 SMB1、關閉未用嘅 SMB Direct，並密切追蹤發行版核心更新，一有修補就升級核心並重開機。
+
+### 5. 有入侵跡象（`[警告]`）
+
+1. 先保留證據：log（包括 `/var/log/php*-fpm.log` 同 nginx error log；3-5 有發現嘅話，成段可疑時間前後嘅 log 都要保留低）、可疑檔案、`ps` 輸出。
 2. 假設所有 credential 已經外洩，全部輪換：
    - `.env` 入面嘅 `APP_KEY`、資料庫密碼、API key
    - SSH key
